@@ -1,0 +1,334 @@
+---
+title: "How Python runs your program"
+---
+
+> *"I type `python script.py` and things happen. But what actually runs my code? People throw around words like 'bytecode', 'the stack', 'the heap', 'references', 'garbage collection' — and I nod, but I couldn't draw you a picture of where my variables actually live or what frees them. I want the real model, not the hand-wave."*
+
+This is the foundation the whole book stands on. Before networking, before threads and locks, you need a true picture of **what happens between `python script.py` and your output** — because almost every confusing thing later (why `b = a` then mutating `b` changes `a`; why two threads corrupt a shared list; what a "stack frame" is; why a thread has its *own* stack but shares the *heap*) is just a consequence of this one model.
+
+We'll build it in the order the machine itself works: **source → bytecode → the interpreter loop → the call stack of frames → the heap of objects → names as references → what reclaims memory.** Every step has runnable code so you *see* it, not just read it.
+
+## The whole picture
+
+```{mermaid}
+flowchart TB
+    SRC["<b>your source</b><br/>script.py (text)"]
+    SRC -->|"compile (once)"| BC["<b>bytecode</b><br/>a list of simple instructions<br/>(cached in __pycache__/*.pyc)"]
+    BC --> VM["<b>the interpreter</b> (CPython)<br/>a loop that runs one bytecode<br/>at a time on a virtual machine"]
+    VM --> STACK["<b>the call STACK</b><br/>one FRAME per function call<br/>(its locals, where to return)"]
+    VM --> HEAP["<b>the HEAP</b><br/>every object lives here<br/>(ints, strings, lists, functions…)"]
+    STACK -.->|"names point to"| HEAP
+    GC["<b>memory management</b><br/>reference counting + cyclic GC<br/>frees heap objects nothing points to"]
+    HEAP --- GC
+    classDef src fill:#2196F3,color:#fff;
+    classDef vm fill:#9C27B0,color:#fff;
+    classDef mem fill:#FFC107,color:#000;
+    class SRC,BC src;
+    class VM vm;
+    class STACK,HEAP,GC mem;
+```
+
+Two storage areas do all the work: the **stack** (where function calls and their local names live, briefly) and the **heap** (where the actual objects live, for as long as something needs them). Hold that split — it returns in every chapter.
+
+## 1. Source → bytecode
+
+Python is often called "interpreted," but there's a compile step first. When you run a file, Python **compiles your source text into bytecode** — a sequence of small, uniform instructions for a virtual machine — and *then* an interpreter executes that bytecode. The compile happens once; the result is cached in `__pycache__/*.pyc` so re-runs skip it.
+
+You can see the bytecode for any function with the `dis` ("disassemble") module:
+
+```{python}
+import dis
+
+def add(a, b):
+    total = a + b
+    return total
+
+dis.dis(add)
+```
+
+Read it top to bottom — these are the literal steps the interpreter will execute:
+
+- `LOAD_FAST a` / `LOAD_FAST b` — push the two local variables onto a working stack
+- `BINARY_OP +` — pop two values, add them, push the result
+- `STORE_FAST total` — pop the result into the local `total`
+- `LOAD_FAST total` / `RETURN_VALUE` — push it back and return it
+
+::: {.callout-note collapse="true"}
+## ▶ Q: "Compiled to bytecode" — so is Python compiled or interpreted?
+
+Both, in sequence — the distinction is muddier than the labels suggest. Your source is **compiled** (ahead of running) to bytecode, exactly like Java compiles to JVM bytecode. Then that bytecode is **interpreted** at runtime by the CPython virtual machine — a loop that dispatches one instruction at a time. So "CPython is a bytecode interpreter" is the precise statement. What Python does *not* do by default is compile to native machine code (the way C does, or the way a JIT like PyPy can) — which is a big part of why pure-Python number-crunching is slower than C, and why the heavy lifting in numerical work is handed to C extensions (NumPy and friends). Keep "compile to bytecode, then interpret" as the mental model.
+:::
+
+## 2. The interpreter is a loop with a working stack
+
+The CPython interpreter is, at heart, a giant loop: *fetch the next bytecode, do what it says, repeat.* It tracks **which instruction is next** — that's the **program counter** — and it executes on a **stack-based virtual machine**: most bytecodes push values onto, or pop values off of, a small *operand stack*.
+
+You saw it above: `a + b` became "push `a`, push `b`, pop-two-and-add, push result." That push/pop rhythm is the whole execution model. You rarely think about the operand stack directly, but it's why the call stack (next section) is called a *stack* — frames are pushed and popped the same last-in-first-out way.
+
+## 3. The call stack — one frame per function call
+
+When your code **calls a function**, the interpreter creates a **frame**: a small workspace holding that call's **local variables**, its operand stack, and a pointer to *where to return* when it finishes. Frames are stacked: calling a function pushes a new frame on top; returning pops it off. This **call stack** is why a traceback reads the way it does — it's literally a printout of the frames currently stacked up.
+
+Let's watch the stack grow and shrink:
+
+```{python}
+import inspect
+
+def depth():
+    # how many frames are currently on the call stack?
+    return len(inspect.stack())
+
+def outer():
+    print(f"  in outer():        stack depth = {depth()}")
+    inner()
+    print(f"  back in outer():   stack depth = {depth()}  (inner's frame popped)")
+
+def inner():
+    print(f"  in inner():        stack depth = {depth()}  (outer's frame still below)")
+
+print(f"at module level:   stack depth = {depth()}")
+outer()
+```
+
+Each call **pushes** a frame (depth goes up); each `return` **pops** it (depth goes back down). The local variables in a frame — like `total` in §1 — exist only while that frame is on the stack; when the function returns, the frame is discarded and its locals vanish. *(This is the per-thread "stack" you'll meet again in the threading chapters: each thread gets its own call stack.)*
+
+Because the stack is finite, infinite recursion doesn't run forever — it hits a guard rail:
+
+```{python}
+import sys
+
+print(f"Python's recursion limit: {sys.getrecursionlimit()}")
+
+def runaway(n=0):
+    return runaway(n + 1)        # never stops calling deeper...
+
+try:
+    runaway()
+except RecursionError as e:
+    print(f"caught: {type(e).__name__} — the call stack hit its maximum depth")
+```
+
+`RecursionError` is the interpreter refusing to push another frame past the limit — a deliberate cap so a runaway recursion can't exhaust memory and crash the process.
+
+## 4. The heap — everything is an object living there
+
+Here's the claim that reframes how you read Python: **everything is an object, and every object lives on the heap.** Not just lists and dicts — integers, strings, functions, classes, even modules are objects on the heap, each with an identity, a type, and a value.
+
+```{python}
+def greet():
+    return "hi"
+
+class Widget:
+    pass
+
+for thing in (42, "hello", [1, 2, 3], greet, Widget):
+    # id() = the object's address/identity on the heap; type() = what it is
+    print(f"  id={id(thing):<18} type={type(thing).__name__:<10} value={thing!r}")
+```
+
+Every one of them — including the function `greet` and the class `Widget` — has an `id()` (its identity, effectively its address on the heap) and a `type()`. That uniformity is why you can put a function in a list, pass a class as an argument, or store anything in a dict: they're all just objects with an address.
+
+## 5. Names are references, not boxes
+
+This is the single most important idea in Python's model, and the source of more bugs than any other misunderstanding. A **variable is not a box that holds a value.** A variable is a **name** that *points to* an object on the heap. Assignment binds a name to an object; it does **not** copy the object.
+
+So `b = a` makes `b` point to the *same* object `a` points to — two names, one object:
+
+```{python}
+a = [1, 2, 3]
+b = a                      # NOT a copy — b now points to the SAME list object
+b.append(4)                # mutate the one object, through the name b
+
+print(f"a = {a}")          # a sees it too — same object!
+print(f"b = {b}")
+print(f"same object? a is b → {a is b}   (id a={id(a)}, id b={id(b)})")
+```
+
+`a` changed because there was only ever **one list**; `a` and `b` are two arrows to it. Mutating through one name is visible through every name. To get an independent copy you must *ask* for one (`b = a.copy()`).
+
+This also pins down two operators people confuse:
+
+- **`is`** — *same object?* (do these two names point to the identical heap object — same `id()`?)
+- **`==`** — *equal value?* (do these two objects have the same contents?)
+
+```{python}
+x = [1, 2, 3]
+y = [1, 2, 3]              # a SEPARATE list with equal contents
+z = x                      # the SAME list as x
+
+print(f"x == y → {x == y}   (equal contents)")
+print(f"x is y → {x is y}   (but different objects)")
+print(f"x is z → {x is z}   (z is literally x)")
+```
+
+::: {.callout-note collapse="true"}
+## ▶ Q: If names are just references, why doesn't `y = x; y += 1` change `x` for integers?
+
+Because integers are **immutable** — you can't change the object `1000` into `1001`; there is no "mutate" operation for an int. So `y += 1` doesn't modify the object `y` points to — it computes a *new* int object and **rebinds** `y` to it, leaving `x` pointing at the original. With a *mutable* object like a list, `b.append(4)` truly mutates the shared object, so every name sees it; with an *immutable* one, any "change" creates a new object and only rebinds the one name.
+
+```python
+x = 1000; y = x      # both point to the int 1000
+y += 1               # makes a NEW int 1001, rebinds y; x still → 1000
+# vs
+a = [1]; b = a       # both point to the same list
+b.append(2)          # mutates THE list; a sees [1, 2] too
+```
+
+**Mutable → shared changes are visible everywhere. Immutable → "changes" make new objects and only move one name.** This distinction is the whole reason threads can corrupt a shared *list* but not a shared *int* by accident — you'll see it again in the race-conditions chapter.
+:::
+
+## 6. What frees memory — reference counting & the cyclic GC
+
+If every object lives on the heap, what cleans them up? Python's main mechanism is **reference counting**: every object keeps a count of *how many references point to it*. Bind a new name → count goes up; a name goes away (reassigned, `del`'d, or its frame pops) → count goes down. **When the count hits zero, nothing can reach the object, so it's freed immediately.**
+
+```{python}
+import sys
+
+obj = [1, 2, 3]
+# getrefcount reports one MORE than you'd expect — passing obj to the function
+# itself creates a temporary reference. So "2" here means "1 real reference".
+print(f"after obj = [...]      refcount ≈ {sys.getrefcount(obj) - 1}")
+
+b = obj                    # a second reference
+print(f"after b = obj         refcount ≈ {sys.getrefcount(obj) - 1}")
+
+c = obj                    # a third
+print(f"after c = obj         refcount ≈ {sys.getrefcount(obj) - 1}")
+
+del b, c                   # drop two references
+print(f"after del b, c        refcount ≈ {sys.getrefcount(obj) - 1}")
+```
+
+The count rises as names point at the list and falls as they go away. When it would reach zero (no names left), the list's memory is reclaimed.
+
+Reference counting has one blind spot: **reference cycles.** If object A points to B and B points back to A, their counts never reach zero even when *nothing else* references them — they keep each other alive. For that, CPython runs a separate **cyclic garbage collector** that periodically finds and frees unreachable cycles:
+
+```{python}
+import gc
+
+class Node:
+    pass
+
+# build a cycle: each node references the other
+a = Node(); b = Node()
+a.partner = b
+b.partner = a
+
+gc.collect()                       # clear the slate
+del a, b                           # drop our only outside references...
+# ...but a<->b still reference EACH OTHER, so refcounting alone can't free them.
+freed = gc.collect()               # the cyclic GC finds and reclaims the cycle
+print(f"objects reclaimed by the cyclic GC: {freed}  (the unreachable cycle)")
+```
+
+So Python's memory management is **two systems working together**: reference counting frees most objects the instant they're unreachable, and the cyclic GC sweeps up the cycles refcounting can't.
+
+## 7. Visualization — a reference count over its lifetime
+
+The clearest way to *see* memory management is to watch an object's reference count rise and fall as names are bound and dropped, and mark the moment it would be freed.
+
+```{python}
+#| fig-cap: "An object's reference count as names are bound to it and dropped. Each new name (b, c, d) raises the count; each `del` lowers it. When the last reference goes (count → 0), the object is freed immediately by reference counting — the red marker."
+import sys
+import matplotlib.pyplot as plt
+
+steps = []
+counts = []
+
+def note(label, value):
+    steps.append(label)
+    counts.append(value)
+
+target = object()                       # a fresh, unshared object
+note("create", sys.getrefcount(target) - 1)
+b = target; note("b = target", sys.getrefcount(target) - 1)
+c = target; note("c = target", sys.getrefcount(target) - 1)
+d = target; note("d = target", sys.getrefcount(target) - 1)
+del b;      note("del b", sys.getrefcount(target) - 1)
+del c;      note("del c", sys.getrefcount(target) - 1)
+del d;      note("del d", sys.getrefcount(target) - 1)
+note("del target → 0 (freed)", 0)       # the final reference goes
+
+fig, ax = plt.subplots(figsize=(9, 4))
+ax.plot(range(len(counts)), counts, marker="o", color="#2196F3", lw=2)
+ax.scatter([len(counts) - 1], [0], color="#F44336", s=140, zorder=5,
+           label="freed (count → 0)")
+ax.set_xticks(range(len(steps)))
+ax.set_xticklabels(steps, rotation=30, ha="right", fontsize=9)
+ax.set_ylabel("reference count", fontsize=11)
+ax.set_ylim(-0.5, max(counts) + 1)
+ax.grid(True, axis="y", alpha=0.3)
+ax.legend()
+plt.tight_layout()
+plt.show()
+```
+
+Every binding is an arrow added to the object; every `del` removes one. The instant the last arrow disappears, the object is unreachable and reclaimed. That rise-and-fall *is* Python's memory model in one picture.
+
+## Q&A from the field
+
+::: {.callout-note collapse="true"}
+## ▶ Q: Where do *global* variables and my objects live vs. local variables?
+
+A **local** variable is a name stored in the current **frame** on the call stack — it exists only while that function call is running, and disappears when the frame pops. A **global** (module-level) name lives in the module's namespace, which persists for the program's life. But here's the key point that confuses people: in *both* cases the name is just a reference — the **object it points to lives on the heap** either way. The stack/globals hold *names*; the heap holds *objects*. So "the list is local" really means "the *name* is local; the list object is on the heap, and it's freed when no name (local or global) references it anymore." This is precisely why, in the threading chapters, each thread has its **own stack** (its own locals) but they all **share the heap** (the same objects) — the danger is always the shared heap, never the private stack.
+:::
+
+::: {.callout-note collapse="true"}
+## ▶ Q: Why does `sys.getrefcount(x)` always look one too high?
+
+Because calling `getrefcount(x)` *passes* `x` as an argument, which binds it to the function's parameter — a temporary extra reference that exists for the duration of the call. So the number you get is always one more than the references in your own code, which is why every example above subtracts 1. It's not a bug; it's the reference model being perfectly consistent — even the act of *asking* about an object creates a reference to it.
+:::
+
+::: {.callout-note collapse="true"}
+## ▶ Q: Is this how *all* Python works, or just CPython?
+
+This describes **CPython** — the reference implementation you almost certainly run (`python.org`'s Python). The *language* (bytecode model, stack/heap, names-as-references, "everything is an object") is universal, but two details are CPython-specific: **reference counting** (other implementations use different garbage collectors) and the exact bytecode. **PyPy** uses a JIT compiler and a tracing garbage collector (no reference counting), **Jython** runs on the JVM, **GraalPy** on GraalVM. They all honor the same *semantics* — your program behaves the same — but the *mechanism* underneath differs. When this book says "the GIL" or "reference counting," it means CPython; the conceptual model (stack, heap, references) holds everywhere.
+:::
+
+## Exercises
+
+### Exercise 1: Read your own bytecode
+
+**Task.** Write a function that loops over a list and sums it, and `dis.dis` it. Identify which bytecodes implement the loop (look for `FOR_ITER` and a jump back). Then disassemble a function using a list comprehension instead and compare.
+
+```{python}
+# YOUR CODE HERE
+```
+
+### Exercise 2: Prove the aliasing trap (and fix it)
+
+**Task.** Write a function `add_item(lst, x)` that appends `x` to `lst` and returns it. Call it with the same list twice and show the list grew both times (shared reference). Then write a *non-mutating* version that returns a new list and leaves the caller's list untouched. Use `is` to prove the second version returns a different object.
+
+```{python}
+# YOUR CODE HERE
+```
+
+### Exercise 3: Watch a reference count change
+
+**Task.** Create a fresh object, then write a loop that appends it to a list 5 times, printing `sys.getrefcount` after each append. Then `clear()` the list and show the count drops back. Explain why each append raised the count.
+
+**Hint.** Remember the `-1` for the temporary reference `getrefcount` itself creates.
+
+```{python}
+# YOUR CODE HERE
+```
+
+### Exercise 4: Make a cycle the refcounter can't free
+
+**Task.** Build two objects that reference each other, drop all external references, and confirm (e.g. with `gc.collect()`'s return value, after `gc.disable()`) that the cycle is only reclaimed by the cyclic GC, not by reference counting alone.
+
+```{python}
+# YOUR CODE HERE
+```
+
+## Where this fits
+
+You now have the model the rest of the book assumes: source is **compiled to bytecode**, an **interpreter loop** runs it on a stack machine, function calls push **frames** onto a **call stack**, every value is an **object on the heap**, **names are references** to those objects (so assignment shares, it doesn't copy), and memory is reclaimed by **reference counting plus a cyclic GC**.
+
+Three threads of the book pull directly on this foundation:
+
+- **Networking** moves *bytes* between programs — and you'll serialize objects to bytes and back, which only makes sense once you know objects live on the heap and names just point at them.
+- **Concurrency** is where the **stack/heap split becomes critical**: each thread gets its *own* call stack (its own frames and locals) but they all *share the one heap* — so two threads mutating the same heap object is the race condition, and the "names are references, mutation is shared" rule from §5 is exactly why it's dangerous.
+- **The GIL**, when we reach it, is a CPython mechanism that exists in large part to make **reference counting** thread-safe — a detail that will mean something to you now that you know what reference counting *is*.
+
+Next we descend into how programs talk to each other over the network; later, we come back to this stack and heap to build threads on top of them.

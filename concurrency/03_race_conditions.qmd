@@ -1,0 +1,326 @@
+---
+title: "The race condition — when sharing goes wrong"
+---
+
+> *"I have two processing threads, and each one bumps a shared `items_processed` counter. Thread A did 100,000 items, thread B did 100,000 items — so the counter should read 200,000. It reads 143,718. Where did 56,282 increments **go**? I didn't drop any items. The number is just… wrong. And it's a *different* wrong number every time I run it."*
+
+This is the chapter the last two were building toward. [Chapter 1](01_what_is_a_thread.qmd) told you threads **share the heap**. [Chapter 2](02_thread_class_and_workers.qmd) carefully made sure every example had threads touch only their *own* data — or had the main thread read a worker's data strictly *after* `join()`. We were tiptoeing around a cliff. This chapter walks straight off it: two running threads writing the **same** object at the **same** time. The result is the **race condition** — the single most important failure mode in all of concurrent programming, and the reason every lock, queue, and primitive in the rest of this part exists.
+
+We're going to **make a counter come out wrong on purpose**, dissect *exactly* which machine steps interleaved to lose those updates, and then answer the question that decides when you're safe and when you're doomed: **what, precisely, is atomic in Python?**
+
+## The whole picture
+
+```{mermaid}
+flowchart TB
+    S["Two threads share one counter on the heap"]
+    S --> RMW["<code>counter += 1</code> is NOT one step.<br/>It's THREE: <b>read → add → write</b>"]
+    RMW --> INT["The OS can switch threads<br/><b>between</b> those steps"]
+    INT --> LOST["Both threads read the SAME old value,<br/>both write back old+1 →<br/><b>one increment vanishes</b> (lost update)"]
+    LOST --> ND["Different interleaving every run →<br/><b>different wrong answer</b> (nondeterministic)"]
+    ND --> FIX["The fix: make read-add-write<br/><b>indivisible</b> — a LOCK (next chapter)"]
+    classDef bad fill:#F44336,color:#fff;
+    classDef ok fill:#4CAF50,color:#fff;
+    class RMW,INT,LOST,ND bad;
+    class FIX ok;
+```
+
+## 1. The intuition — two cooks, one tally sheet
+
+Two cooks share a single sheet of paper with a number on it: *"meals served so far."* Each time a cook serves a meal, they update the tally. But "update the tally" is really three separate physical actions:
+
+1. **Read** the current number off the sheet ("it says 41").
+2. **Add one** in your head ("42").
+3. **Write** the new number back on the sheet ("42").
+
+Now imagine cook A reads `41`, and *before A writes `42` back*, cook B also reads `41` (the sheet still says 41!), adds one, and writes `42`. Then A writes its `42`. **Two meals were served, but the tally only went up by one.** The sheet says 42; it should say 43. One meal vanished from the count — not because a meal wasn't served, but because both cooks based their update on the *same stale reading*.
+
+That's a **race condition**: the final result depends on the exact *timing* of how two threads' steps interleave — a race to the paper that nobody knew they were running. And critically, **the meal still got cooked** (the work happened); only the *shared bookkeeping* got corrupted. Hold onto that — it's why a race in our pipeline loses *count* of items without dropping any actual item.
+
+## 2. See it break
+
+Let's reproduce it. Two threads, each adding 1 to a shared `counter` one hundred thousand times. The correct answer is obviously `200000`.
+
+First, the honest engineering note, because it matters:
+
+::: {.callout-important}
+## Why we add a tiny `sleep` in the middle of these demos
+
+In CPython a thread switch happens only at certain moments, so a tight increment loop often races through its whole read-modify-write *between* switches — meaning the bug exists but **shows up only intermittently**. That intermittency is exactly what makes races dangerous: the code "works" a thousand times, then corrupts data in production. To make the bug **reliably visible** in a book build, we insert a microscopic `time.sleep(...)` *between the read and the write*. That stretches the race window so the collision the OS would otherwise produce only occasionally happens on almost every iteration. We are not *creating* the bug — we're making an always-present bug fire on cue. Remove the `sleep` and the race becomes intermittent again, **not gone**.
+:::
+
+```{python}
+import threading
+import time
+
+counter = 0
+
+def add_many(how_many):
+    global counter
+    for _ in range(how_many):
+        # We write the increment as its real steps, because that's literally
+        # what `counter += 1` compiles to (proven in §3). The sleep in the
+        # middle widens the race window so the lost update happens reliably.
+        current = counter        # 1. READ the shared value
+        time.sleep(1e-5)         #    ← another thread can read the SAME value here
+        counter = current + 1    # 2. WRITE back — possibly clobbering its update
+
+N = 2_000
+a = threading.Thread(target=add_many, args=(N,), name="Proc-A")
+b = threading.Thread(target=add_many, args=(N,), name="Proc-B")
+a.start(); b.start()
+a.join(); b.join()
+
+print(f"expected : {2 * N}")
+print(f"actual   : {counter}")
+print(f"LOST     : {2 * N - counter} updates vanished into the race")
+```
+
+The counter is **well under 4,000**, and if you ran it again you'd get a *different* wrong number. No work was skipped — every loop iteration ran — but thousands of increments overwrote each other. That gap is the lost-update race, live.
+
+## 3. Why — `+= 1` is not one step
+
+The whole bug rests on one fact people refuse to believe: **`counter += 1` is not a single, indivisible operation.** It's three. We don't have to take that on faith — Python's `dis` module shows us the actual bytecode the interpreter runs:
+
+```{python}
+import dis
+
+def increment():
+    global counter
+    counter += 1
+
+dis.dis(increment)
+```
+
+Read the disassembly: there's a **`LOAD_GLOBAL`** (read `counter`), a load of the constant `1`, a **`BINARY_OP`** (the add), and a **`STORE_GLOBAL`** (write `counter` back). Four bytecodes; at minimum a **read, an add, and a write** — three logically distinct steps, with gaps between them where the GIL can hand the CPU to another thread.
+
+Here's the fatal interleaving spelled out. Both threads start with `counter == 41`:
+
+| Time | Thread A | Thread B | `counter` |
+|---|---|---|---|
+| 1 | **read** → sees 41 | | 41 |
+| 2 | | **read** → sees 41 | 41 |
+| 3 | add → 42 (in A's head) | | 41 |
+| 4 | | add → 42 (in B's head) | 41 |
+| 5 | **write** 42 | | 42 |
+| 6 | | **write** 42 | 42 |
+
+Two increments happened. `counter` went `41 → 42`, not `41 → 43`. **B's read at step 2 was stale** — it read before A's write at step 5 — so B's write at step 6 clobbered A's. One update lost. Multiply that by the thousands of times this window opens across 200,000 iterations, and you get the missing ten-thousands.
+
+::: {.callout-note collapse="true"}
+## ▶ Q: Why doesn't the GIL prevent this? I thought only one thread runs at a time.
+
+The GIL guarantees only one thread runs Python bytecode *at a time* — but a race doesn't need two threads running *simultaneously*. It only needs the OS to **switch threads between two of the bytecodes** that make up `counter += 1`. The GIL is happy to be released after `LOAD_GLOBAL` and handed to the other thread *before* `STORE_GLOBAL` runs. So thread A reads, the GIL switches, thread B reads-adds-writes, the GIL switches back, and A writes its now-stale value. One-at-a-time execution does **not** mean each *line* of your code is indivisible. The GIL makes individual *bytecodes* atomic, not your *statements*. That gap — bytecode-atomic vs statement-atomic — is the entire bug, and §4 maps exactly where it bites.
+:::
+
+## 4. What *is* atomic in Python?
+
+So when are you safe? The practical rule of thumb under CPython's GIL: **a single bytecode operation is atomic; anything that takes more than one is not.** That gives a usable (but treacherous) table:
+
+| Operation | Atomic under the GIL? | Why |
+|---|---|---|
+| `x = value` (plain assignment) | ✅ yes | one `STORE` |
+| `list.append(x)`, `list.pop()` | ✅ yes | one C-level call holding the GIL |
+| `d[key] = value` (set existing-style) | ✅ yes | one `STORE_SUBSCR` |
+| `x += 1`, `d[k] += 1`, `x = x + 1` | ❌ **no** | read **and** write — multiple steps |
+| `if k not in d: d[k] = ...` (check-then-act) | ❌ **no** | the state can change between check and act |
+| `a, b = b, a` involving shared vars | ❌ **no** | multiple loads/stores |
+| reading *then* writing *any* shared variable | ❌ **no** | the gap is the race |
+
+::: {.callout-warning}
+## Do not build on this table
+
+It is real, but it's a **trap to rely on**, for three reasons:
+1. **It's CPython-specific and unspecified.** It's an accident of the current implementation, not a language guarantee. It has changed across versions.
+2. **It evaporates without the GIL.** In **free-threaded Python** (3.13+, Chapter 8), threads run Python bytecode *truly in parallel*, so even some single-bytecode operations need protection. Code that "worked" because of GIL-atomicity can start corrupting data.
+3. **Real logic is never one operation.** "Increment a counter," "add to a dict if absent," "update two related fields together" — all multi-step. The moment your invariant spans more than one bytecode, atomicity can't save you.
+
+**The professional default: if two threads share mutable data and at least one writes, protect every access with a lock — don't reason about bytecode.** Reserve the atomic table for understanding *why* races happen, not for deciding to skip a lock.
+:::
+
+## 5. The race that isn't a lost update — check-then-act
+
+Lost updates are the famous race, but there's a sneakier family: **check-then-act**, where two threads both check a condition, both see it's safe to proceed, and both act — when only one should have. No counter is "lost"; instead an action happens *twice*, or on stale assumptions.
+
+```{python}
+import threading
+import time
+
+cache = {}
+init_count = 0                       # how many times we (wrongly) initialized
+
+def get_or_create(key):
+    global init_count
+    if key not in cache:             # CHECK  ← every thread can pass this at once
+        time.sleep(1e-3)             #   widen the window: all threads get past CHECK
+        value = f"created-by-{threading.current_thread().name}"
+        init_count += 1              # ACT    ← so creation happens MORE THAN ONCE
+        cache[key] = value
+
+threads = [threading.Thread(target=get_or_create, args=("config",),
+                            name=f"T{i}") for i in range(8)]
+for t in threads: t.start()
+for t in threads: t.join()
+
+print(f"cache initialized {init_count} time(s) — we wanted exactly 1")
+```
+
+Eight threads, one key — yet it gets "created" more than once, because several threads passed the `if key not in cache` check *before any of them wrote*. In real code this double-creates database connections, opens duplicate files, or double-charges a customer. **The check and the act must be one indivisible unit** — which, again, is a lock.
+
+## 6. The running example — corrupting the pipeline's stats
+
+Now the bug in *our* system. Two worker threads pull items and update shared statistics: total items processed, and a count of items that failed validation. Without protection, both counters race.
+
+```{python}
+import threading
+import time
+
+# shared statistics for the whole pipeline (on the heap, seen by all threads)
+stats = {"items_processed": 0, "errors_found": 0}
+
+def process_items(n, error_every):
+    """Pretend to process n items; tally results into the SHARED stats."""
+    for i in range(n):
+        # --- the actual "processing" would go here (each item IS handled) ---
+        # --- but the shared bookkeeping races: ---
+        seen = stats["items_processed"]      # READ
+        time.sleep(5e-5)                      # race window (stand-in for real work)
+        stats["items_processed"] = seen + 1  # WRITE  — clobbers the other thread
+        if i % error_every == 0:
+            stats["errors_found"] += 1
+
+ITEMS = 1_000
+workers = [
+    threading.Thread(target=process_items, args=(ITEMS, 7), name="Worker-A"),
+    threading.Thread(target=process_items, args=(ITEMS, 7), name="Worker-B"),
+]
+for w in workers: w.start()
+for w in workers: w.join()
+
+print(f"items actually processed by the two threads : {2 * ITEMS}")
+print(f"items_processed says                        : {stats['items_processed']}")
+print(f"→ the count is wrong, yet NO item was skipped — only the tally raced")
+```
+
+This is the exact bug from the chapter's opening quote. Every item *was* processed — the work is correct — but the shared *count* is garbage, because two threads raced on `items_processed`. In any data pipeline, a corrupted error tally is worse than a crash: it's a **silent** wrong answer you might ship.
+
+## 7. Visualization — nondeterminism made visible
+
+The most unsettling property of a race is that it gives a **different answer every run**. Let's make that concrete: run the two-thread counter race many times and plot where the final value lands. A correct program would put every bar on `2N`. The race scatters them — all *below* the correct value, by varying amounts.
+
+```{python}
+#| fig-cap: "Final counter value across 20 runs of the same two-thread program. The dashed green line is the correct answer (2N); every single run falls short. With the wide race window we forced, each run loses about half its updates — narrow the window toward realistic sizes and the shortfall becomes smaller and more erratic, but never zero."
+import threading
+import time
+import matplotlib.pyplot as plt
+
+shared = 0
+def bump(n):
+    global shared
+    for _ in range(n):
+        cur = shared
+        time.sleep(5e-5)      # the same widened race window as §2
+        shared = cur + 1
+
+def one_run(n, n_threads=2):
+    global shared
+    shared = 0
+    ts = [threading.Thread(target=bump, args=(n,)) for _ in range(n_threads)]
+    for t in ts: t.start()
+    for t in ts: t.join()
+    return shared
+
+N = 300
+results = [one_run(N) for _ in range(20)]
+
+correct = 2 * N
+fig, ax = plt.subplots(figsize=(9, 4))
+ax.bar(range(len(results)), results, color="#F44336", label="actual (raced)")
+ax.axhline(correct, color="#4CAF50", ls="--", lw=2, label=f"correct = {correct}")
+ax.set_xlabel("run number", fontsize=11)
+ax.set_ylabel("final counter value", fontsize=11)
+ax.set_ylim(0, correct * 1.05)
+ax.legend(loc="lower right")
+ax.grid(True, axis="y", alpha=0.3)
+plt.tight_layout()
+plt.show()
+
+print(f"correct answer : {correct}")
+print(f"range of wrong answers across {len(results)} runs: "
+      f"{min(results)} … {max(results)}")
+```
+
+Same program, same input — and not one run produces the right answer. Here the forced-wide window makes the loss consistent (about half), but the deeper lesson is the one you can't see in a single run: **a race condition isn't a bug that's sometimes there — it's a bug whose *symptom* is sometimes there.** Narrow the window to realistic sizes and these bars would scatter unpredictably — some runs almost correct, some badly wrong. The defect is permanent; only its visibility flickers with timing. That's why you can't test a race away by "running it again," and why you must reason about it structurally.
+
+## Q&A from the field
+
+::: {.callout-note collapse="true"}
+## ▶ Q: If the race only shows up when I add a `sleep`, is it really a problem in normal code?
+
+Yes — the `sleep` only changes *how often* you see it, not *whether* it exists. Without it, the read-modify-write window is just a few nanoseconds wide, so on a quiet machine you might run the racy code thousands of times cleanly. Then reality widens the window for you: the "work" between read and write isn't a `sleep` in production — it's a real computation, a cache miss, a log call, an OS preemption at a bad moment, or simply more threads on more cores. Any of those reopens the gap. Races are notorious for passing every test and failing under load, months later, irreproducibly. Our `sleep` just compresses "might fail eventually" into "fails now," so you can *see* and *fix* it. **Intermittent is not the same as harmless** — it's worse, because it hides.
+:::
+
+::: {.callout-note collapse="true"}
+## ▶ Q: Are local variables ever involved in races?
+
+No — and this is the reassuring flip side. A **local variable lives on the thread's own private stack** (Chapter 1), so no other thread can even *see* it, let alone race on it. The `current`/`seen` temporaries inside our loops are local and private; the race is entirely about the **shared** `counter` / `stats` they read from and write to. This is the deep reason the safest concurrent style is to **keep data thread-local and share as little mutable state as possible** — what you don't share can't race. Processes take this to the extreme (share *nothing*), which is exactly why they sidestep races at the cost of having to *send* data instead.
+:::
+
+::: {.callout-note collapse="true"}
+## ▶ Q: `list.append` is atomic — so a shared list is thread-safe, right?
+
+*Each individual* `append` is atomic, so you won't corrupt the list's internal structure by appending from many threads. But that's a much weaker guarantee than "thread-safe." The moment your logic spans more than one operation — `if len(lst) < 10: lst.append(x)` (check-then-act), or "pop from one list and append to another" (two ops), or "read the last element and act on it" — you're back in race territory, because another thread can change the list *between* your operations. So: a shared list won't *crash*, but your *invariants* about it still need a lock. And under free-threaded Python (Chapter 8), even the single-append guarantee is provided by internal locking, not by a global one. Treat "X is atomic" as "X won't corrupt memory," never as "my logic using X is correct."
+:::
+
+## Exercises
+
+### Exercise 1: How the window controls the damage
+
+**Task.** Run the §2 counter race at several `sleep` values between the read and write: `0` (no sleep), `1e-6`, `1e-5`, `1e-4`. For each, record how many updates are lost. Observe how a wider window loses more updates — and that even `sleep(0)` (which only *yields*, with no real delay) can already lose some.
+
+**Hint.** Wrap the race in a function that takes the sleep duration and returns the lost count.
+
+```{python}
+# YOUR CODE HERE
+# Expected: a wider race window → more lost updates.
+```
+
+### Exercise 2: Make the race vanish without a lock
+
+**Task.** Rewrite the two-thread counter so the final total is *always* exactly `2N` — **without** using any lock or shared counter. Each thread should count into its **own local variable**, and the main thread sums the two results *after* `join()`.
+
+**Hint.** This is the §"local variables don't race" insight made into a fix. Use the Chapter 2 "read the result off the thread after join" pattern.
+
+```{python}
+# YOUR CODE HERE
+# Expected: always 2N, every run — because nothing is shared while running.
+```
+
+### Exercise 3 (Pipeline): expose the error-tally race
+
+**Task.** Take the §6 pipeline-stats demo and make it *visibly* wrong for `errors_found` specifically: run it 10 times and print the error count each run. Confirm the count is both wrong and different across runs. Then state, in a comment, what the *correct* `errors_found` should be.
+
+```{python}
+# YOUR CODE HERE
+```
+
+### Exercise 4: Spot the check-then-act bug
+
+**Task.** Here is a "thread-safe-looking" bank withdrawal. Explain in a comment why it can let the balance go **negative** with concurrent withdrawals, and identify the exact check-then-act window.
+
+```{python}
+balance = 100
+def withdraw(amount):
+    global balance
+    if balance >= amount:        # CHECK
+        # ...what can happen here with two threads?...
+        balance -= amount        # ACT
+# YOUR ANALYSIS HERE (as a comment). A fix comes in the next chapter.
+```
+
+## Where this fits
+
+You've now seen the enemy directly: a **race condition** is what happens when two threads' read-modify-write (or check-then-act) sequences interleave on **shared mutable state**, producing results that are wrong, and *unpredictably* wrong. You know *why* (`+= 1` is three bytecodes, and the GIL only makes individual bytecodes atomic), you know the treacherous **atomicity table** and why not to lean on it, and you've watched the same program give twenty different answers.
+
+Every fix comes down to one idea: make a multi-step operation **indivisible** — guarantee that once a thread starts a read-modify-write, no other thread can touch that data until it's done. That guarantee is **mutual exclusion**, and the tool that provides it is the **lock**.
+
+[Chapter 4](04_lock_and_rlock.qmd) introduces `threading.Lock` and `RLock`: we'll wrap the racy counter in a lock and watch it hit exactly `200000` every time, learn `with lock:` and why you hold it as briefly as possible, then meet the lock's *own* dark side — **deadlock** — and the discipline (lock ordering, reentrancy with `RLock`) that prevents it. The bank-withdrawal bug from Exercise 4 gets its proper fix there.

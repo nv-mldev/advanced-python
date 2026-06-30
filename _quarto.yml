@@ -1,0 +1,44 @@
+project:
+  type: book
+  output-dir: _book
+
+book:
+  title: "Advanced Python Programming"
+  subtitle: "How Python really runs — execution and parallelism, one concept at a time"
+  author: "Nithin"
+  search: true
+  reader-mode: true
+  page-footer:
+    left: "Advanced Python Programming"
+    right: "Built with Quarto"
+  sidebar:
+    style: docked
+    collapse-level: 1
+  chapters:
+    - index.qmd
+    - part: "Python Foundations"
+      chapters:
+        - foundations/01_how_python_runs.qmd
+    - part: "Concurrency — Threads in Depth"
+      chapters:
+        - concurrency/01_what_is_a_thread.qmd
+        - concurrency/02_thread_class_and_workers.qmd
+        - concurrency/03_race_conditions.qmd
+        - concurrency/04_lock_and_rlock.qmd
+
+format:
+  html:
+    theme:
+      - cosmo
+    toc: true
+    toc-depth: 3
+    toc-location: right
+    code-copy: true
+    code-overflow: wrap
+    fig-cap-location: bottom
+    mermaid:
+      theme: default
+
+execute:
+  freeze: auto      # cache cell outputs; only re-run a chapter when it changes
+  warning: false

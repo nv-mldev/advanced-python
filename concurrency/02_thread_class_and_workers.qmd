@@ -1,0 +1,464 @@
+---
+title: "The Thread class — creating and managing workers"
+---
+
+> *"Okay, I believe a worker thread is real now — I saw it print its own name and id. But how do I actually **control** one? How do I pass it data, get a result back, wait for it, run a dozen of them, or set one running quietly in the background? And why does my program sometimes hang forever when it should just exit?"*
+
+[Chapter 1](01_what_is_a_thread.qmd) answered *what a thread is*. This chapter is the hands-on follow-up: **how you create, configure, and steer workers** with Python's `threading.Thread` class. By the end you'll know every method on a `Thread`, the two ways to build one, the traps that bite everyone (calling `run()` instead of `start()`; programs that won't exit), and you'll have written the **first thread of our running example — a data producer** that every later chapter builds on.
+
+::: {.callout-tip}
+## The running example for this whole part
+
+From here on, one system carries every chapter — a classic **producer/consumer data pipeline**:
+
+> **producer thread → a bounded queue → a pool of worker threads → results streamed over a socket → clients.**
+
+It's a general shape that shows up everywhere: a log/event ingester, a web-scraping pipeline, a job-processing server, a sensor-data collector. We build it one thread and one primitive at a time, finishing with a runnable socket-streaming **capstone**. The cells that *execute here* use a tiny in-memory item source so the threading behaviour is real and reproducible; the socket/streaming pieces are shown as source you run in your own script. This chapter builds the **producer** — the thread at the head of the pipeline.
+:::
+
+## The whole picture — a `Thread` object is a remote control
+
+```{mermaid}
+flowchart TB
+    MK["<b>Make it</b><br/>Thread(target=fn, args=…)<br/>— or subclass and override run()"]
+    MK --> ST["<b>.start()</b><br/>spawns the OS thread,<br/>puts it in Ready, calls run()<br/><i>(call ONCE)</i>"]
+    ST --> AL["<b>while it runs</b><br/>.is_alive() → True<br/>.name · .ident · .native_id"]
+    AL --> JN["<b>.join()</b><br/>caller BLOCKS until it finishes<br/>.join(timeout) → wait at most N s"]
+    JN --> DN["<b>finished</b><br/>.is_alive() → False<br/>read results off the object"]
+    AL -.->|"daemon=True"| BG["<b>background worker</b><br/>killed abruptly when<br/>main thread exits"]
+    classDef mk fill:#2196F3,color:#fff;
+    classDef act fill:#4CAF50,color:#fff;
+    classDef warn fill:#F44336,color:#fff;
+    class MK,ST mk;
+    class AL,JN,DN act;
+    class BG warn;
+```
+
+The mental model: a `Thread` **object** is not the thread itself — it's a **remote control** for one. You build the remote, press `.start()` to launch the actual worker, then use the other buttons (`.join()`, `.is_alive()`) to monitor and wait for it. Keep that separation in mind; it explains most of the surprises below.
+
+## 1. Two ways to build a worker
+
+There are exactly two ways to give a thread something to do.
+
+**Way A — pass a target function (the common one).** You hand `Thread` a function to call. This is what you'll use 95% of the time.
+
+```{python}
+import threading
+
+def produce_one(item_id):
+    me = threading.current_thread()
+    print(f"  [{me.name}] produced item {item_id}")
+
+worker = threading.Thread(target=produce_one, args=(0,), name="Producer")
+worker.start()
+worker.join()
+```
+
+**Way B — subclass `Thread` and override `run()`.** You make your own class, put the work in a `run()` method, and `start()` calls it. Use this when the worker needs to **hold state** (counters, buffers, a stop flag) — which our producer will.
+
+```{python}
+import threading
+
+class GreetingThread(threading.Thread):
+    def __init__(self, who):
+        super().__init__(name=f"Greeter-{who}")   # ALWAYS call super().__init__()
+        self.who = who                            # state lives on the instance
+
+    def run(self):                                # start() will call this
+        print(f"  [{self.name}] hello from {self.who}")
+
+t = GreetingThread("Ada")
+t.start()
+t.join()
+```
+
+::: {.callout-warning}
+## The #1 subclassing bug: forgetting `super().__init__()`
+
+If your `__init__` doesn't call `super().__init__()`, the `Thread` machinery is never set up, and `.start()` raises `RuntimeError: thread.__init__() not called`. Always call it first. (And put your work in `run()` — never name your method `start`.)
+:::
+
+**Which to use?**
+
+| Use **target function** when… | Use **subclass** when… |
+|---|---|
+| the work is a simple callable | the worker carries **state** (counters, buffers, a stop flag) |
+| you want the least ceremony | you want named methods like `.stop()` on the worker |
+| (most cases) | the worker *is* a long-lived component (our producer/worker threads) |
+
+Our pipeline threads carry state and a stop switch, so the running example uses **subclassing**. For one-off jobs, reach for `target`.
+
+## 2. Passing data *in* — `args` and `kwargs`
+
+A thread's function rarely takes zero arguments. You pass them when you build the `Thread`, **not** when you start it:
+
+```{python}
+import threading
+
+def process(item_id, *, mode):
+    print(f"  processing item {item_id} in '{mode}' mode")
+
+# positional args go in a TUPLE; keyword args go in a DICT
+t = threading.Thread(target=process, args=(7,), kwargs={"mode": "edges"})
+t.start()
+t.join()
+```
+
+::: {.callout-warning}
+## `args` must be a tuple — the one-argument comma trap
+
+`args` is a tuple of positional arguments. For a **single** argument you still need the trailing comma: `args=(7,)`. Writing `args=(7)` passes the *integer* `7`, not a one-tuple — Python then tries to unpack `7` as the argument list and you get a confusing `TypeError`. `(7,)` is a tuple; `(7)` is just `7` in parentheses.
+:::
+
+## 3. Getting data *out* — threads don't `return`
+
+Here's a wall everyone hits. A thread's target can `return` a value, but **nobody receives it** — `start()` doesn't hand it back, and there's no `worker.start()` result.
+
+```{python}
+import threading
+
+def compute():
+    return 42                # this return value goes NOWHERE the caller can see
+
+t = threading.Thread(target=compute)
+t.start()
+result = t.join()            # join() ALWAYS returns None — not 42
+print(f"what join() gave us: {result}")
+```
+
+So how *do* you get a result out? Three ways, in increasing sophistication:
+
+1. **Store it on the thread object** (clean with a subclass): the worker writes to `self.something`, and after `join()` you read it. Safe because `join()` guarantees the worker has *finished* before you read (a "happens-before" relationship — no race).
+2. **A shared container** (a list/dict the worker appends to) — works, but if *multiple* threads write to it you've created a race condition (Chapter 3) and need a lock (Chapter 4).
+3. **A `queue.Queue` or a `Future`** — the real tools, coming in Chapter 7.
+
+Here's pattern 1, which our producer uses:
+
+```{python}
+import threading
+
+class SumThread(threading.Thread):
+    def __init__(self, n):
+        super().__init__()
+        self.n = n
+        self.result = None              # a slot for the answer
+
+    def run(self):
+        self.result = sum(range(self.n))   # write the result onto myself
+
+t = SumThread(1000)
+t.start()
+t.join()                                # wait until run() has finished...
+print(f"result read off the thread: {t.result}")   # ...THEN read it safely
+```
+
+::: {.callout-note collapse="true"}
+## ▶ Why is reading `t.result` after `join()` safe, with no lock?
+
+Because `join()` creates a **happens-before** ordering: everything the worker did in `run()` is guaranteed complete and visible *before* `join()` returns. You're not reading `t.result` *while* the thread writes it — you're reading it strictly *after* the thread is dead. A race needs two threads touching the same data *concurrently*; here the access is sequential (worker writes, then joins, then main reads). No overlap → no race → no lock needed. The moment you read shared data *while* a thread is still running, that reasoning collapses — which is exactly the next chapter.
+:::
+
+## 4. The lifecycle methods — every button on the remote
+
+Now the full control surface. We'll provoke each one.
+
+### `start()` vs `run()` — the trap that silently removes your concurrency
+
+This is the most important distinction in the whole chapter.
+
+- **`start()`** spawns a *new* OS thread and arranges for `run()` to execute *there*.
+- **`run()`** is just a normal method. Calling it yourself runs the code in the **current** thread — **no new thread is created at all.**
+
+Calling `run()` instead of `start()` doesn't error. Your program works — it's just secretly **single-threaded**. Watch:
+
+```{python}
+import threading
+
+def show_where_i_run(tag):
+    print(f"  {tag}: running in '{threading.current_thread().name}'")
+
+print("with .start()  →", end=" ")
+t1 = threading.Thread(target=show_where_i_run, args=("start",), name="Worker-A")
+t1.start(); t1.join()      # prints 'Worker-A' — a real new thread
+
+print("with .run()    →", end=" ")
+t2 = threading.Thread(target=show_where_i_run, args=("run",), name="Worker-B")
+t2.run()                   # prints 'MainThread' — NO new thread; ran right here!
+```
+
+The `.run()` line printed `MainThread`, not `Worker-B`: the work happened on the main thread. If your "threaded" code mysteriously isn't faster and everything runs in `MainThread`, this is almost always why. **Always `start()`.**
+
+::: {.callout-warning}
+## `start()` works exactly once
+
+Calling `.start()` a second time on the same `Thread` object raises `RuntimeError: threads can only be started once`. A `Thread` object is single-use — to run the work again, build a new `Thread`. (This is why thread *pools* exist: to reuse worker threads without rebuilding them — Chapter 7.)
+:::
+
+### `join()`, `join(timeout)`, and `is_alive()` — waiting and supervising
+
+`join()` blocks the *calling* thread until the target finishes. With a `timeout`, it waits **at most** that long, then returns whether or not the thread is done — so you check `is_alive()` to find out which happened.
+
+```{python}
+import threading
+import time
+
+def slow_job():
+    time.sleep(0.5)
+
+t = threading.Thread(target=slow_job)
+t.start()
+
+t.join(timeout=0.1)                 # wait up to 0.1s — NOT enough
+print(f"after short join: alive? {t.is_alive()}")   # True — still going
+
+t.join()                            # now wait as long as it takes
+print(f"after full join:  alive? {t.is_alive()}")   # False — finished
+```
+
+`join(timeout)` is how you supervise a worker without blocking forever — "give it 5 seconds to shut down, then move on." We'll use exactly this for graceful shutdown later.
+
+### Identity — `name`, `ident`, `native_id`
+
+Recap from Chapter 1, now as configuration: set `name` when you build the thread (it's for *your* logs/debugging — it has no effect on behaviour). `ident` is Python's unique id while the thread is alive; `native_id` is the kernel's TID (what `top -H` shows).
+
+```{python}
+import threading
+
+t = threading.Thread(target=lambda: None, name="Inspector")
+t.start()
+print(f"name={t.name}  ident={t.ident}  native_id={t.native_id}")
+t.join()
+```
+
+## 5. Daemon threads — background workers that die with the program
+
+By default a thread is **non-daemon**: Python will **not exit** until it finishes. That's why your script sometimes seems to "hang" at the end — a non-daemon thread is still running, and the interpreter politely waits for it.
+
+A **daemon** thread is the opposite: it's a background helper, and when the **main thread exits, all daemon threads are killed instantly** — mid-line, no cleanup, no `finally` blocks guaranteed. You set it *before* `start()`.
+
+```{python}
+import threading
+import time
+
+def background_heartbeat():
+    # a daemon: a tidy loop, but it will be cut off when main exits
+    for i in range(40):
+        time.sleep(0.05)
+
+beat = threading.Thread(target=background_heartbeat, daemon=True)
+beat.start()
+print(f"is it a daemon? {beat.daemon}   alive? {beat.is_alive()}")
+time.sleep(0.12)            # main does a little work...
+print("main is about to exit — the daemon will be killed, not joined")
+# (no join) — when this cell's program ends, `beat` is terminated abruptly
+```
+
+::: {.callout-important}
+## The daemon trade-off — convenience vs. cleanup
+
+- **Daemon (`daemon=True`):** the process can exit even if this thread is still looping. Great for *fire-and-forget* background helpers (a metrics poller, a heartbeat). **Danger:** it's killed *abruptly* — if it was writing a file or holding a resource, that work is interrupted with no chance to clean up.
+- **Non-daemon (default):** the process waits for it. Safe for work that *must* finish, but a non-daemon thread stuck in an infinite loop will **hang your program on exit** forever.
+
+The professional pattern is *neither extreme*: a non-daemon (or daemon) worker with an explicit **stop signal** (an `Event`) and a bounded `join(timeout)`, so it shuts down *cleanly and promptly*. We build that in Chapter 6; for now, just know: **"my program won't exit" = a non-daemon thread still running**, and **"my background work got cut off" = a daemon killed at exit.**
+:::
+
+::: {.callout-warning}
+## You can't change `daemon` after `start()`
+
+Setting `t.daemon = True` after the thread is started raises `RuntimeError: cannot set daemon status of active thread`. Decide before you launch it (pass `daemon=` to the constructor, or set it before `.start()`).
+:::
+
+## 6. The running example — the producer
+
+Now we assemble what we've learned into the head of the pipeline: a **producer thread** that generates work items and counts them, with a clean stop switch. It's a `Thread` subclass because it carries state (`items_produced`, the latest item) and a stop flag.
+
+A real producer usually pulls from a **blocking source** — reading lines off a network socket, pulling rows from a database, waiting on a sensor or a message broker. Those reads *block*, which is exactly why the producer lives in its own thread: while it sits in *Blocked* waiting for the next item, the rest of the program stays responsive. Here's the shape, with the blocking source shown as a placeholder you'd swap for your real one:
+
+```python
+# producer.py  — sketch you adapt to your real source
+import threading
+
+class ProducerThread(threading.Thread):
+    """Pulls items from some (blocking) source until asked to stop."""
+
+    def __init__(self, source):
+        super().__init__(name="Producer", daemon=True)   # background producer
+        self.source = source            # e.g. a socket, a DB cursor, a broker client
+        self.items_produced = 0
+        self.latest_item = None
+        # NOTE: don't name this `_stop` — threading.Thread already has an internal
+        # `_stop()` method, and shadowing it with a bool breaks the thread. (We
+        # upgrade this plain flag to a threading.Event in Chapter 6.)
+        self._stop_requested = False
+
+    def run(self):
+        for item in self.source:        # iterating a real source BLOCKS between items
+            if self._stop_requested:
+                break
+            self.items_produced += 1
+            self.latest_item = item     # newest item, for others to read
+
+    def stop(self):
+        self._stop_requested = True
+```
+
+To **run and reason about it here in the book**, we plug in an in-memory source that yields items with a small delay (standing in for the blocking wait). The threading structure is *identical*; only the source changes:
+
+```{python}
+import threading
+import time
+
+class ProducerThread(threading.Thread):
+    """Generates `n` work items, pausing between each to mimic a blocking source."""
+
+    def __init__(self, n, interval=0.005):
+        super().__init__(name="Producer", daemon=True)
+        self.n = n
+        self.interval = interval
+        self.items_produced = 0
+        self.latest_item = None
+        self._stop_requested = False     # not `_stop` — see note in the source above
+
+    def run(self):
+        for i in range(self.n):
+            if self._stop_requested:
+                break
+            time.sleep(self.interval)        # pretend the next item takes time to arrive
+            item = {"id": i, "payload": i * i}   # a work item is just a small dict here
+            self.items_produced += 1
+            self.latest_item = item
+
+    def stop(self):
+        self._stop_requested = True
+
+producer = ProducerThread(n=1000, interval=0.005)
+producer.start()             # producer runs in the background
+time.sleep(0.25)             # let it produce for a quarter second
+producer.stop()              # flip the stop flag
+producer.join(timeout=1.0)   # wait (briefly) for run() to notice and exit
+
+print(f"produced ~{producer.items_produced} items in 0.25s "
+      f"(expected ≈ {int(0.25 / 0.005)})")
+print(f"latest item: {producer.latest_item}  alive? {producer.is_alive()}")
+```
+
+We started a background worker, let it produce, signalled it to stop, joined it with a timeout, and then safely read its results off the object (the §3 pattern). That's the entire Chapter-2 toolkit in one place — and the producer the rest of the pipeline will consume from.
+
+::: {.callout-note collapse="true"}
+## ▶ Q: The stop flag is a plain `self._stop_requested = True` — isn't that a race condition?
+
+A fair worry, and the honest answer is: *for a single boolean flag set by one thread and read by another, in CPython, this particular case is safe enough* — assigning and reading a bool is atomic under the GIL (Chapter 3 makes "what's atomic" precise). But it's **fragile**: it relies on GIL specifics, gives no way to *wait* for the stop (the reader has to poll), and doesn't generalize. The robust, portable tool is `threading.Event` — same idea, but explicit, waitable, and correct without leaning on GIL trivia. We deliberately use the plain flag now and **upgrade it to an `Event` in Chapter 6**, so you see *why* the better tool exists before adopting it.
+:::
+
+## 7. Visualization — the lifecycle, and daemon vs. non-daemon at exit
+
+The clearest picture of this chapter is *when each method takes effect* along a worker's life, and how a **daemon** vs **non-daemon** thread changes when the program can exit.
+
+```{python}
+#| fig-cap: "Top: a non-daemon worker — main reaches the end but the program cannot exit until the worker finishes and is joined. Bottom: a daemon worker — main exits on its own schedule and the daemon is killed mid-work. The dashed red line is 'program exits here'."
+import matplotlib.pyplot as plt
+
+COLORS = {"main": "#2196F3", "worker": "#4CAF50", "daemon": "#FF9800",
+          "killed": "#F44336"}
+
+fig, (ax_top, ax_bot) = plt.subplots(2, 1, figsize=(9, 4.2), sharex=True)
+
+# --- non-daemon: program waits for the worker ---
+ax_top.broken_barh([(0, 3)], (1.6, 0.6), facecolors=COLORS["main"])      # main runs
+ax_top.broken_barh([(1, 5)], (0.6, 0.6), facecolors=COLORS["worker"])    # worker runs
+ax_top.axvline(6, color=COLORS["killed"], ls="--", lw=2)                 # exit
+ax_top.text(3.05, 1.7, "main reaches end of code", va="center", fontsize=9)
+ax_top.text(1.05, 0.7, "non-daemon worker (program waits → join)", va="center", fontsize=9)
+ax_top.text(6.1, 1.2, "program\nexits", color=COLORS["killed"], fontsize=9)
+ax_top.set_yticks([0.9, 1.9]); ax_top.set_yticklabels(["worker", "main"])
+ax_top.set_title("Non-daemon: the program cannot exit until the worker finishes", fontsize=10)
+
+# --- daemon: program exits and kills the worker ---
+ax_bot.broken_barh([(0, 3)], (1.6, 0.6), facecolors=COLORS["main"])      # main runs
+ax_bot.broken_barh([(1, 2)], (0.6, 0.6), facecolors=COLORS["daemon"])    # daemon runs...
+ax_bot.broken_barh([(3, 3)], (0.6, 0.6), facecolors=COLORS["killed"], alpha=0.4)  # ...killed
+ax_bot.axvline(3, color=COLORS["killed"], ls="--", lw=2)
+ax_bot.text(3.05, 1.7, "main exits", va="center", fontsize=9)
+ax_bot.text(1.05, 0.7, "daemon (killed mid-work →)", va="center", fontsize=9)
+ax_bot.text(3.1, 1.2, "program\nexits\n(daemon cut off)", color=COLORS["killed"], fontsize=9)
+ax_bot.set_yticks([0.9, 1.9]); ax_bot.set_yticklabels(["daemon", "main"])
+ax_bot.set_title("Daemon: main exits on its own; the daemon is killed where it stands", fontsize=10)
+ax_bot.set_xlabel("time →", fontsize=11)
+
+for ax in (ax_top, ax_bot):
+    ax.set_xlim(0, 8); ax.grid(True, axis="x", alpha=0.3)
+plt.tight_layout()
+plt.show()
+```
+
+The top row is why a forgotten non-daemon thread *hangs* your program; the bottom is why a daemon's work can be *cut off*. The fix for both — a stop signal plus a bounded join — is Chapter 6.
+
+## Q&A from the field
+
+::: {.callout-note collapse="true"}
+## ▶ Q: How many threads can I create? Is there a limit?
+
+Practically, yes. Each thread gets its **own stack** (Chapter 1), typically allocated around **8 MB** of virtual address space on Linux by default — so thousands of threads cost real memory, and the OS imposes limits (`ulimit -u`). More importantly, past a point **more threads make things slower**, not faster: the scheduler spends its time context-switching instead of doing work (oversubscription). Rule of thumb: for I/O-bound work, tens to low hundreds of threads is fine; if you're reaching for thousands, you want **async** (one thread, many awaited waits) instead. For CPU-bound work, more threads than cores never helps (and the GIL caps it at one anyway). Chapter 11 measures exactly where the payoff stops.
+:::
+
+::: {.callout-note collapse="true"}
+## ▶ Q: My script prints everything but then just hangs and never returns to the prompt — why?
+
+Almost certainly a **non-daemon thread still running**. Python waits for every non-daemon thread before exiting, so if you started a worker with an infinite loop (a server, a poll loop) and never gave it a way to stop, the interpreter waits for it *forever*. Three fixes, best last: (1) make it `daemon=True` if its work is truly disposable; (2) give it a stop flag/`Event` and `join()` it before the end (Chapter 6); (3) check `threading.enumerate()` at the end of your program to see *which* thread is keeping you alive. The hang is not a crash — it's Python being faithful to "non-daemon threads must finish."
+:::
+
+::: {.callout-note collapse="true"}
+## ▶ Q: Should I subclass `Thread` or pass a `target`? I see both everywhere.
+
+Default to **`target`** — less code, and it keeps the *work* separate from the *threading*. Reach for a **subclass** only when the worker genuinely needs to be an *object*: it holds state across its lifetime (counters, buffers), exposes methods (`.stop()`, `.latest_item`), or *is* a long-lived component of your system. Our producer and worker threads qualify on all three counts, which is why the running example subclasses. A good test: if you find yourself passing the same several variables through `args` and threading mutable containers in to collect results, that state wants to live on a subclass instead.
+:::
+
+## Exercises
+
+### Exercise 1: Prove `run()` doesn't make a thread
+
+**Task.** Write a function that prints `threading.current_thread().name`. Call it three ways: (a) directly as `fn()`, (b) via a `Thread` with `.run()`, (c) via a `Thread` with `.start()`. Predict which print `MainThread` before running.
+
+**Expected output.** (a) and (b) print `MainThread`; only (c) prints the worker's name.
+
+```{python}
+# YOUR CODE HERE
+```
+
+### Exercise 2: A worker that returns a result, two ways
+
+**Task.** Compute `sum(range(1_000_000))` in a worker thread and get the answer back in the main thread, **(a)** by subclassing and storing it on `self`, and **(b)** by passing in a one-element list the worker writes to. Confirm both give the same number.
+
+**Hint.** Read the result only *after* `join()` — that's what makes it safe without a lock.
+
+```{python}
+# YOUR CODE HERE
+```
+
+### Exercise 3 (Pipeline): a producer with a throughput report
+
+**Task.** Extend `ProducerThread` so that after you `stop()` and `join()` it, you can ask it for the **actual average throughput** it achieved (`items_produced / elapsed_seconds`, i.e. items per second). Time it with `time.perf_counter()` (Chapter 1's monotonic clock). Run it for 0.3 s and print the measured rate.
+
+**Hint.** Record a start timestamp in `run()` and an end timestamp when the loop exits; expose `throughput()` as a method read after join.
+
+```{python}
+# YOUR CODE HERE
+# Expected: a measured items/sec rate close to the target you set.
+```
+
+### Exercise 4: Make a hang, then fix it
+
+**Task.** Write a worker with `while True: time.sleep(0.1)` and start it **non-daemon**. Observe (or reason about) why the program would hang at exit. Then fix it two ways: once by making it a daemon, once by adding a stop flag and `join(timeout=1)`.
+
+```{python}
+# YOUR CODE HERE
+# (Run the hang version in your own terminal, not here — it won't terminate.)
+```
+
+## Where this fits
+
+You can now create workers (target or subclass), feed them data (`args`/`kwargs`), retrieve results (off the object, after `join()`), supervise them (`join(timeout)`, `is_alive()`), and choose between foreground and background (`daemon`) — and you've built the pipeline's **producer**.
+
+But notice what we carefully *avoided*: every example so far had threads touch only their **own** data, or had the main thread read a worker's data strictly **after** `join()`. The moment two running threads write the **same** object at the **same** time — say, a shared `items_processed` counter updated by two workers — the convenient shared heap from Chapter 1 turns dangerous.
+
+That collision is the **race condition**, and [Chapter 3](03_race_conditions.qmd) provokes one on purpose: we'll watch a counter end up *wrong*, figure out exactly which machine-level steps interleaved to corrupt it, and pin down the surprising rules of **what is and isn't atomic in Python**. That's the problem every lock in the following chapters exists to solve.

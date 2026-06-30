@@ -1,0 +1,553 @@
+---
+title: "What is a thread?"
+---
+
+> *"The concurrency chapter told me threads 'overlap I/O waits' and 'share memory' — but what **is** one? When I write `threading.Thread(...)`, what did the operating system actually hand me? What does it own, what does it borrow, and what is it doing when it's 'waiting'?"*
+
+The [Python Concurrency](../socket/04_python_concurrency.qmd) chapter gave you the *map* — threads vs. processes vs. async, and when to reach for each. This chapter zooms all the way in on **one box on that map**: the thread itself. We start from first principles, build up exactly what a thread is made of, and watch it move through its life — so that everything later (the GIL, locks, race conditions) lands on solid ground.
+
+::: {.callout-tip}
+## How to use this chapter
+
+Every code block is meant to be **copied into a file and run** — `python demo.py` — so you watch the behaviour with your own eyes. The runnable versions live in `codes/concurrency/`. Times will vary on your machine; the *shape* of the output is what matters.
+
+One idea at a time: **what a thread is → what it owns vs. shares → the three states it lives in → seeing all three in code.**
+:::
+
+## A short history — where threads came from
+
+Threads didn't arrive fully formed. They're the end of a fifty-year separation of two ideas that started fused together: *"a running program"* and *"a single sequence of steps through it."* Early computers ran one sequence, full stop. Everything below is the slow prying-apart of those two ideas — until "the program" (the process, with its memory) and "the sequence of steps" (the thread) became separate, schedulable things.
+
+::: {.callout-tip collapse="true"}
+## ▶ **Edsger Dijkstra** (1930–2002) — cooperating sequential processes
+
+In *Cooperating Sequential Processes* (1968) and the THE operating system, **Dijkstra** made the first rigorous case that a computer could be understood as **several sequential processes running concurrently**, and invented the **semaphore** to coordinate them safely. This is the intellectual root of the whole field: the moment "one program = one sequence" stopped being assumed. Every lock you'll ever write is a descendant of his semaphore.
+:::
+
+::: {.callout-tip collapse="true"}
+## ▶ **Per Brinch Hansen & C. A. R. Hoare** (1970s) — monitors and structured coordination
+
+Coordinating concurrent work with raw semaphores is error-prone. **Per Brinch Hansen** (RC 4000 system, 1970) and **Tony Hoare** (*Monitors: An Operating System Structuring Concept*, 1974) introduced the **monitor** — bundling shared data with the locks that protect it, so the language enforces safe access. Python's `with lock:` and `threading.Condition` are monitors in spirit. Hoare's later **CSP** (1978) seeded the *other* tradition — message passing instead of shared memory — which you'll recognize in Go's goroutines and in Python's own `multiprocessing.Queue`.
+:::
+
+::: {.callout-tip collapse="true"}
+## ▶ The thread becomes a first-class OS object — Mach & POSIX (1980s–1995)
+
+For decades the "sequence of steps" stayed welded to the process. Carnegie Mellon's **Mach** kernel (mid-1980s) cleanly split them: a *task* owned the memory and resources, while one or more *threads* were the schedulable sequences inside it — exactly the process/thread split this chapter draws. The idea spread, but every Unix had its own incompatible API, so in **1995** IEEE standardized **POSIX threads (`pthreads`, IEEE 1003.1c)**. That standard is what `threading` in Python, and threads in C, Java, and almost everything else, ultimately sit on top of.
+:::
+
+::: {.callout-tip collapse="true"}
+## ▶ Hardware learns to multithread — barrel processors to SMT (1964–2002)
+
+Hardware multithreading is *older* than the software kind. Seymour Cray's **CDC 6600** (1964) used a **barrel processor** — its I/O units cycled through ten "threads" one per clock, the first fine-grained hardware multithreading. The **Denelcor HEP** (Burton Smith, ~1982) built a whole CPU around the idea. The modern form was named in **1995** by **Dean Tullsen, Susan Eggers, and Henry Levy** (University of Washington) — *Simultaneous Multithreading* — running instructions from several threads through one superscalar core *in the same cycle*. Intel shipped it commercially as **Hyper-Threading** in the Pentium 4 (2002). We unpack exactly what that means in §7.
+:::
+
+## The whole picture, before the details
+
+```{mermaid}
+flowchart TB
+    P["<b>A PROCESS</b><br/>one running program<br/>(its own memory)"]
+    P --> SH["<b>SHARED inside the process</b><br/>the code · the data &amp; objects<br/>open files · OS resources"]
+    P --> T1["<b>Thread 1</b><br/>private: PC · registers · stack"]
+    P --> T2["<b>Thread 2</b><br/>private: PC · registers · stack"]
+    P --> T3["<b>Thread 3</b><br/>private: PC · registers · stack"]
+    SH -.->|all threads see this| T1
+    SH -.->|all threads see this| T2
+    SH -.->|all threads see this| T3
+    classDef proc fill:#9C27B0,color:#fff;
+    classDef shared fill:#FFC107,color:#000;
+    classDef thr fill:#2196F3,color:#fff;
+    class P proc;
+    class SH shared;
+    class T1,T2,T3 thr;
+```
+
+Hold this picture: **a thread is a worker living *inside* a process.** Each worker keeps a tiny private notebook (where it is in the code, its scratch values, its own to-do pile) but shares the whole building — the data, the objects, the open files — with every other worker in that process. Almost everything in this chapter is a consequence of that one arrangement.
+
+The words *stack* and *heap* are about to do a lot of work, and they trip up almost everyone the first time. So before we define a thread precisely, the next section pins down — with a tiny program and a picture — **where a running program actually keeps its stuff.** If you already know the stack/heap cold, skim it; otherwise it's the section that makes the rest click.
+
+## 1. The intuition — a thread is a worker following a recipe
+
+Picture a single recipe pinned to the kitchen wall. That recipe is your **program** — a fixed list of steps. Now bring in a **cook**. The cook is a **thread**: an independent line of execution that walks *down* the recipe, doing one step at a time.
+
+To do that, the cook needs three small private things, and nothing more:
+
+- **A finger on the recipe** — "I'm on step 7." If you have two cooks, each needs their own finger; otherwise they'd lose their place. This is the **program counter**.
+- **A few scratch values held in hand** — the egg count, the running total. This is the **registers**.
+- **A stack of sticky notes for nested tasks** — "to make the sauce I must first make the roux; to make the roux I must first…" Each task-within-a-task adds a note; finishing one peels it off. This is the **call stack**.
+
+Everything *else* — the ingredients in the fridge, the pots, the oven, the shared shopping list on the counter — belongs to the **kitchen**, not to any one cook. The kitchen is the **process**. Add a second cook and they share all of it instantly: no one hands the fridge over, it's just *there* for both.
+
+That is the whole idea. **A thread is a cook with a finger, a handful of scratch values, and a stack of sticky notes, working inside a shared kitchen.** When the concurrency chapter said threads "share memory," this is what it meant: same kitchen, different fingers.
+
+::: {.callout-tip collapse="true"}
+## ▶ Where the word "thread" comes from
+
+The metaphor is older than computing. A **thread of execution** is the single strand you could trace through a program if you followed it step by step — the way you'd trace a thread through cloth. A single-threaded program is one strand; a multi-threaded program is several strands woven through the *same* fabric of shared memory. The image of *interleaving strands* is exactly why concurrent execution is called "weaving" or "interleaving" threads.
+:::
+
+## 2. A detour we need: where a running program keeps its stuff
+
+To say what a thread *owns*, we first have to know the **places a program stores things while it runs**. There are a few, and you've been using all of them without naming them. Let's name them with the smallest possible program — read it, then we'll trace where each piece lives:
+
+```{python}
+def make_greeting(name):
+    greeting = "Hello, " + name      # `greeting` is a local variable
+    return greeting
+
+message = make_greeting("Ada")       # call the function, keep the result
+print(message)
+```
+
+While this tiny program runs, the computer is juggling three separate questions: *which line am I on, what are my current function's variables, and where do the actual objects live?* Each has its own home.
+
+**① The program counter — "which line am I on?"**
+The CPU always knows the one next instruction to run. Picture a finger pointing at the current line. When `make_greeting(...)` is called, the finger jumps *into* the function; when the function returns, the finger jumps *back* to the line that called it. That bookmark is the **program counter**. (There's also a handful of tiny ultra-fast CPU slots called **registers** holding the exact values being computed *this instant* — like the numbers you keep in your head mid-sum. Group the program counter and registers together as "the CPU's current working state.")
+
+**② The stack — "the pile of functions running right now, and their local variables."**
+Every time you *call* a function, the program drops a fresh scratch-pad on top of a pile. That pad — a **stack frame** — holds the function's local variables (here, `name` and `greeting`) plus a note of where to return when it's done. When the function finishes, its pad is thrown away and the pad below resumes. It's called a *stack* because it behaves exactly like a stack of plates: you only ever add to or remove from the **top**.
+
+So the instant `make_greeting("Ada")` is running, the pile looks like this (top = what's running now):
+
+```
+┌─────────────────────────────────────┐  ← TOP (running now)
+│  make_greeting frame                 │
+│     name     = "Ada"                 │
+│     greeting = "Hello, Ada"          │
+├─────────────────────────────────────┤
+│  module frame  (the top level)       │
+│     message  = …waiting for return…  │
+└─────────────────────────────────────┘  ← bottom
+```
+
+The moment `make_greeting` returns, its whole frame is discarded — `name` and `greeting` simply **cease to exist**. That's the defining trait of the stack: **local variables live and die with the function call.**
+
+**③ The heap — "the big shared pool where the actual objects live."**
+Here's the part that trips beginners up. The variable `greeting` is just a *name living in a stack frame* — but the actual string object `"Hello, Ada"` does **not** live in that frame. It lives in a separate, large, long-lived region called the **heap**. The stack frame only holds a *reference* — an arrow pointing at the object on the heap.
+
+Why split it this way? Because some data has to **outlive** the function that created it. When `make_greeting` returned, we threw its stack frame away — yet we still need that string, because we returned it and `message` now points at it. The *name* `greeting` died with the frame; the *string object* survived on the heap. The heap is the program's storage for things that must stick around.
+
+Here's the whole picture — **names on the stack, objects on the heap, arrows connecting them:**
+
+```{mermaid}
+flowchart LR
+    subgraph STACK["THE STACK — names &amp; calls (private, dies with each call)"]
+        direction TB
+        F2["make_greeting frame<br/>name ●<br/>greeting ●"]
+        F1["module frame<br/>message ●"]
+    end
+    subgraph HEAP["THE HEAP — the real objects (long-lived, shared pool)"]
+        direction TB
+        O1["string object:<br/>'Ada'"]
+        O2["string object:<br/>'Hello, Ada'"]
+    end
+    F2 -->|name → | O1
+    F2 -->|greeting → | O2
+    F1 -->|message → | O2
+    classDef st fill:#2196F3,color:#fff;
+    classDef hp fill:#FFC107,color:#000;
+    class F2,F1 st;
+    class O1,O2 hp;
+```
+
+In Python this is literally how variables work: **a variable is a name on the stack; the object it names lives on the heap.** That's why `b = a` doesn't copy anything — it just makes a second name (`b`) point at the *same* heap object. We can watch it: two names, one object.
+
+```{python}
+a = ["shared", "list"]
+b = a                       # NOT a copy — b is a second name for the same object
+b.append("changed!")        # we change it through b...
+print(f"a is now: {a}")     # ...and a sees it too — same object on the heap
+print(f"same object? {a is b}  (id: {id(a)})")
+```
+
+Both names see the change because there is only **one object** on the heap; `a` and `b` are just two arrows to it. Hold onto this — it is the *entire* reason threads sharing memory is both convenient and dangerous.
+
+To carry forward, here's the whole storage map and — the key column — **how many of each a program has:**
+
+| Place | Holds | Lives until | How many? |
+|---|---|---|---|
+| **Program counter + registers** | which line is next, current working values | the next instant | **one per thread** |
+| **Stack** | running functions + their local variables | the function returns | **one per thread** |
+| **Heap** | the actual objects/data | nothing references them anymore | **one, shared by all** |
+
+That last column is the punchline, and it's exactly what the next section claims about threads: **each thread gets its own program counter and its own stack, but every thread shares the one heap.** Now that sentence means something concrete.
+
+::: {.callout-note collapse="true"}
+## ▶ Q: Is the stack FIFO?
+
+No — the stack is **LIFO** (Last In, First Out). FIFO (First In, First Out) is a **queue**. A stack is a pile of plates: you add and remove only from the **top**, so the *last* thing in is the *first* out. The call stack *has* to work this way — the **last** function you called is running now and must finish (pop off) **before** you can return to the one that called it. (The FIFO cousin, the *queue*, shows up later as `multiprocessing.Queue`, where messages come out in the order they went in.)
+:::
+
+::: {.callout-note collapse="true"}
+## ▶ Q: Registers and the heap both store data — what's the difference?
+
+Both hold data, but they're opposite ends of the memory world. **Registers** are a handful of tiny slots *inside the CPU* holding the value being computed *this instant* — fastest thing there is, **private to one thread**, overwritten constantly. The **heap** is a huge pool in *main memory* holding the long-lived objects your program creates — slower to reach, **shared by all threads**, and data survives there until nothing references it.
+
+The analogy: registers are the numbers you hold *in your head* while adding; the heap is the *warehouse* where the boxes are stored. You can't compute on the warehouse directly — the CPU **loads** values from the heap *into* registers, works on them, then **stores** results back. Registers are where work *happens*; the heap is where data *lives*. (This is why a context switch must save/restore registers — they're per-thread — but never the heap, which is shared.)
+:::
+
+## 3. The anatomy — what a thread owns vs. what it shares
+
+Now make the intuition precise, using the words we just grounded. A process is one running program with its own memory. A thread is an independent line of execution *inside* that process. The crucial split is **private vs. shared** — and it maps one-to-one onto the storage map above.
+
+::: {.callout-important}
+## A thread, defined
+
+A **thread** is the smallest unit the operating system schedules to run. It carries exactly three **private** things — the three "one per thread" rows from the storage map you just saw:
+
+- **Program counter** — which instruction this thread runs next. ("Which step am I on.")
+- **Registers** — the CPU's working values for *this* thread at this instant. ("What I'm holding in my head.")
+- **Stack** — this thread's own pile of running functions and their local variables. ("My own to-do pile of nested tasks.")
+
+Everything else is **shared** with the other threads in the same process:
+
+- the **code** (the program's instructions everyone is walking through),
+- the **objects and data** — that one shared **heap** from the last section, plus any global variables,
+- the process's **OS resources**: open files, sockets, and so on.
+
+In one line: **threads of one process get their own program counter and stack, but share the heap.** Different *processes*, by contrast, share **nothing** by default — each gets its own private copy of all of the above.
+:::
+
+The reason this matters is the entire trade-off you met in the overview chapter, now traceable to its root:
+
+| | **Two threads** (same process) | **Two processes** |
+|---|---|---|
+| Code / globals / heap | **shared** — same objects | **separate** — own copies |
+| PC, registers, stack | private (one set each) | private (one set each) |
+| Passing data | just read the same variable | must **send** it (queue/pipe) |
+| Accidental interference | **possible** (race conditions) | impossible (no shared state) |
+
+So "threads can corrupt each other's data" and "processes can't" aren't arbitrary rules — they fall directly out of *the heap is shared for threads, separate for processes*. We'll provoke a race in a later chapter; for now just note **where** the danger lives: the shared box, never the private one.
+
+::: {.callout-note collapse="true"}
+## ▶ Show the cost: why switching threads is cheaper than switching processes
+
+The single biggest practical reason to reach for threads is that the CPU can swap between them cheaply.
+
+When the OS pauses one execution context and resumes another, it performs a **context switch**: save the outgoing context's private state (PC, registers, stack pointer), load the incoming one's. For **two threads in the same process**, that's *all* it has to do — they share the same memory map, so the address translation tables (and the CPU's cached translations, the TLB) stay valid.
+
+For **two different processes**, the OS must additionally switch the entire **memory map** — a different virtual-to-physical address space — which typically **flushes the TLB** and cold-caches. That extra work is why a process switch is markedly heavier than a thread switch.
+
+**Takeaway:** threads are the *lightweight* way to get concurrency, precisely because the expensive part (the address space) is shared, not swapped.
+:::
+
+## 4. The three states — Ready, Running, Blocked
+
+A thread is not running every instant it exists. On any machine there are usually far more threads than CPU cores, so the OS scheduler is constantly choosing *who runs now*. From a thread's point of view, its life is a tiny state machine with three states:
+
+```{mermaid}
+stateDiagram-v2
+    [*] --> Ready: thread created<br/>(start())
+    Ready --> Running: scheduler picks it<br/>— its turn on a core
+    Running --> Ready: time slice ends /<br/>preempted by scheduler
+    Running --> Blocked: waits on something<br/>(I/O, sleep, a lock)
+    Blocked --> Ready: the wait is over<br/>— condition satisfied
+    Running --> [*]: function returns<br/>(thread finishes)
+```
+
+Read it as the cook's day:
+
+- **Ready** — *able* to work, standing in line for a stove. The thread exists and has everything it needs except a free CPU core. A freshly `start()`ed thread enters here.
+- **Running** — actually executing on a core right now. Only as many threads can be *Running* at once as you have cores (and in CPython, the GIL tightens this further for Python bytecode — a later chapter).
+- **Blocked** — *deliberately* waiting for something external: a network reply, a disk read, a `sleep`, or a lock held by another thread. A blocked thread is **not** burning CPU — it has stepped out of the line entirely and won't be considered for a core until its wait ends.
+
+The two transitions people conflate are worth separating:
+
+- **Running → Ready** is *involuntary*: the scheduler's time slice expired and someone else gets a turn. The thread is still perfectly able to run.
+- **Running → Blocked** is *because the thread asked to wait*. It cannot make progress until the world changes (data arrives, the lock frees).
+
+::: {.callout-note collapse="true"}
+## ▶ Q: "Only as many Running as cores" — is that a Python limit or universal?
+
+Universal — it's hardware. A core executes one instruction stream at a time, so on *N* logical CPUs at most *N* threads physically run at once, in **any** language; the rest sit Ready or Blocked. CPython then adds a **second, stricter** ceiling: the **GIL** lets only **one** thread run *Python bytecode* at a time regardless of cores. The two don't clash, because a thread doing **blocking I/O releases the GIL** while it waits — so several Python threads can be "Running on a core" (down in C/the kernel) at once, which is exactly why threads still help I/O-bound work. Only *executing Python* is capped at one. **Hardware ceiling = logical CPUs (any program); GIL ceiling = 1 for Python code (CPython only) — and it sits below the hardware one.**
+:::
+
+::: {.callout-warning}
+## "Blocked" is the good kind of waiting
+
+It's easy to read "Blocked" as bad. It's the opposite. A blocked thread releases its core so *other* threads can run — which is the **entire reason threads help with I/O-bound work**. Three threads each blocked on a 2-second network wait can all be blocked *at the same time*, so the waits overlap and finish together (~2 s, not ~6 s). The win you saw in the concurrency chapter **is** three threads sitting in the Blocked state simultaneously. Blocking ≠ wasting; *busy-waiting* (spinning in Running while you wait) is the waste.
+:::
+
+## 5. The code — meeting a thread
+
+First cell does imports and one fact most people miss: **your program is already running in a thread before you create any.** The interpreter starts in the *main thread*.
+
+```{python}
+import threading
+import time
+
+# The code you're reading already runs inside a thread — the "main" thread.
+# You never created it; the interpreter did. A thread isn't exotic; it's the
+# default unit a program runs as. Creating more just adds workers to the kitchen.
+current = threading.current_thread()
+print(f"I am running in : {current.name}")
+print(f"Live threads right now: {threading.active_count()}")
+print(f"They are          : {[t.name for t in threading.enumerate()]}")
+```
+
+::: {.callout-note}
+## What count you'll see depends on *where* you run it
+
+`active_count()` counts every thread in the whole **process**, not just the ones you made. The output printed above comes from the book's build environment, which executes cells through a **Jupyter kernel** — and that kernel is itself multi-threaded, so you'll see extra threads it created (`IOPub`, `Heartbeat`, `Control`, `Shell channel`, `_watch_pipe_fd`, …) alongside `MainThread`. Run the *same code as a standalone script* — `python demo.py` — and the process is just your program, so you'll see exactly one thread: `['MainThread']`.
+:::
+
+Now add a worker. A `Thread` pairs a *target* function with a private execution context. `.start()` puts it in the **Ready** state (the OS takes over from there); `.join()` makes the caller wait until the worker finishes. (We use just enough of the API here to *watch* a thread come and go — [Chapter 2](02_thread_class_and_workers.qmd) teaches the `Thread` class and these methods properly.)
+
+```{python}
+def worker(label):
+    me = threading.current_thread()
+    # `label` is the argument we passed in via args=(...) — proof the thread
+    # ran OUR function with OUR data. `me.ident` is Python's unique id for this
+    # thread (me.native_id is the kernel's TID) — proof it's a distinct
+    # schedulable entity, not just a function call on the main thread.
+    print(f"  [{me.name}] running job '{label}'  (thread id = {me.ident})")
+
+print(f"before: {threading.active_count()} thread (just main)")
+
+helper = threading.Thread(target=worker, args=("first-job",), name="Worker-1")
+helper.start()             # Ready -> the scheduler will run it
+helper.join()              # main thread BLOCKS here until Worker-1 returns
+
+print(f"after : {threading.active_count()} thread again (Worker-1 finished)")
+```
+
+### Private stack vs. shared heap — seen, not asserted
+
+Here is the private/shared split made visible. A **local** variable lives on the calling thread's *private stack* — each thread gets its own. A **global** object lives on the *shared heap* — every thread sees the same one and can change it for everyone.
+
+```{python}
+shared_counter = {"value": 0}      # one dict object on the shared heap
+
+def add_some(label, how_many):
+    # `local_tally` is on THIS thread's private stack — invisible to others.
+    local_tally = 0
+    for _ in range(how_many):
+        local_tally += 1
+        shared_counter["value"] += 1   # reaches into the SHARED object
+    print(f"  [{label}] my private tally = {local_tally} "
+          f"(lived on my own stack)")
+
+threads = [
+    threading.Thread(target=add_some, args=("A", 1000)),
+    threading.Thread(target=add_some, args=("B", 1000)),
+]
+for t in threads: t.start()
+for t in threads: t.join()
+
+# Each thread's private tally was 1000. The shared object saw BOTH.
+print(f"shared_counter seen by all threads = {shared_counter['value']}")
+```
+
+The two private tallies never knew about each other — separate stacks. The one shared dict absorbed *both* threads' work — shared heap. That single difference is the seed of every race condition you'll meet later.
+
+### Watching a thread move through the three states
+
+We can't ask Python "are you Ready or Running right now?" — those are OS-internal (see the Q&A below). But we *can* instrument the moments a thread enters and leaves a state we control, stamp each with a clock, and reconstruct its timeline. We use `time.perf_counter()` — the monotonic, high-resolution clock — exactly because we're measuring *elapsed durations*, where the wall clock can't be trusted.
+
+```{python}
+import time
+import threading
+
+start = time.perf_counter()
+events = []                         # (thread_name, state, t_enter, t_leave)
+events_lock = threading.Lock()      # a "one thread at a time" guard for the shared
+                                    # list (it's on the heap!). Why this is needed —
+                                    # and what a Lock is — is Chapter 4; here just
+                                    # read it as "don't let two threads append at once."
+
+def record(name, state, t0, t1):
+    with events_lock:
+        events.append((name, state, t0 - start, t1 - start))
+
+def life_of_a_thread(name, work_before, wait, work_after):
+    # RUNNING: do a little CPU work
+    t0 = time.perf_counter()
+    sum(i*i for i in range(work_before))
+    t1 = time.perf_counter();  record(name, "Running", t0, t1)
+
+    # BLOCKED: voluntarily wait (sleep stands in for I/O / a lock)
+    t0 = time.perf_counter()
+    time.sleep(wait)
+    t1 = time.perf_counter();  record(name, "Blocked", t0, t1)
+
+    # RUNNING again: finish up
+    t0 = time.perf_counter()
+    sum(i*i for i in range(work_after))
+    t1 = time.perf_counter();  record(name, "Running", t0, t1)
+
+threads = [
+    threading.Thread(target=life_of_a_thread, args=("T1", 200_000, 0.15, 120_000)),
+    threading.Thread(target=life_of_a_thread, args=("T2", 120_000, 0.10, 200_000)),
+    threading.Thread(target=life_of_a_thread, args=("T3", 160_000, 0.20, 160_000)),
+]
+for t in threads: t.start()         # all three -> Ready, then Running/Blocked
+for t in threads: t.join()
+
+for name, state, a, b in sorted(events, key=lambda e: e[2]):
+    print(f"  {name}  {state:8s}  {a*1000:6.1f} ms -> {b*1000:6.1f} ms")
+```
+
+Notice in the printout that the three **Blocked** stretches *overlap in time* — all three threads sleep at once. That overlap is the entire payoff of threading for waiting work.
+
+## 6. The visualization — a thread's life as a timeline
+
+The clearest way to *see* the three states is a timeline: one row per thread, colored bars for each state segment. This is the same data we just recorded, drawn as a Gantt-style chart.
+
+```{python}
+#| fig-cap: "Three threads moving through Running (green) and Blocked (red) over time. The Blocked stretches overlap — all three wait simultaneously, which is exactly why threaded I/O finishes in the time of the longest single wait, not the sum of them."
+import matplotlib.pyplot as plt
+
+COLORS = {"Running": "#4CAF50", "Blocked": "#F44336", "Ready": "#FFC107"}
+
+# rows, top to bottom, by thread name
+names = ["T1", "T2", "T3"]
+row_of = {name: i for i, name in enumerate(reversed(names))}
+
+fig, ax = plt.subplots(figsize=(9, 3.5))
+for name, state, a, b in events:
+    ax.broken_barh([(a * 1000, (b - a) * 1000)],
+                   (row_of[name] - 0.35, 0.7),
+                   facecolors=COLORS[state], edgecolor="white")
+
+ax.set_yticks(range(len(names)))
+ax.set_yticklabels(list(reversed(names)))
+ax.set_xlabel("time (ms since start)", fontsize=11)
+ax.set_ylabel("thread", fontsize=11)
+ax.grid(True, axis="x", alpha=0.3)
+
+# a small legend built from the palette
+handles = [plt.Rectangle((0, 0), 1, 1, color=COLORS[s]) for s in ("Running", "Blocked")]
+ax.legend(handles, ("Running", "Blocked"), loc="upper right", ncol=2, framealpha=0.9)
+plt.tight_layout()
+plt.show()
+```
+
+Read the picture the way the OS does: each row is one cook's day, green where they're actually cooking (on a core), red where they've stepped aside to wait. The red bars stacking up at the same time is concurrency made visible — three waits happening *together* instead of one after another.
+
+::: {.callout-note collapse="true"}
+## ▶ An honest caveat about this figure
+
+We colored only **Running** and **Blocked**, because those are the moments our Python code can actually timestamp. The true **Ready** state — *able to run but queued, waiting for a free core* — happens inside the OS scheduler and is invisible from Python. In reality there are slivers of *Ready* squeezed between these bars (and inside the green ones, since CPython's GIL lets only one thread run Python bytecode at a time, so the others are briefly Ready even while "Running"). The figure is an honest view of *what we can observe*, not a claim that there's zero Ready time. The GIL — the reason those green bars don't truly overlap for CPU work — is its own chapter.
+:::
+
+## 7. Software threads vs. hardware threads — and what Hyper-Threading really is
+
+Everything so far has been about **software threads** — the OS abstraction we create with `threading.Thread`. You can make thousands of them; the OS scheduler time-slices them onto whatever cores exist. But how many can *physically* run at the same instant? That's a **hardware** question, and the answer is where Hyper-Threading enters.
+
+A single physical core spends a surprising amount of time **stalled** — waiting on a cache miss, a memory fetch, a mispredicted branch — with its expensive execution units sitting idle. Hardware multithreading is the CPU's own trick for filling those gaps: keep more than one thread's state *inside the core* so that when one thread stalls, the core has another thread's work ready to run instead of going idle. CPU designers have done this three ways:
+
+| Hardware approach | How it shares the core | When it switches threads |
+|---|---|---|
+| **Coarse-grained** (block) | one thread runs; another is held ready | only on a *long* stall (e.g. cache miss) |
+| **Fine-grained** (interleaved) | threads take turns cycle by cycle | **every clock cycle**, round-robin |
+| **Simultaneous (SMT)** | multiple threads' instructions issue **together** | no switch — they run *in the same cycle* |
+
+**Intel's Hyper-Threading is the third one: SMT.** A modern superscalar core can issue several instructions per cycle but rarely finds enough independent work in *one* thread to keep all its units busy. SMT exposes one physical core to the OS as **two logical cores** by duplicating only the cheap, thread-private state — the architectural **registers and program counter** (exactly the private elements from §2!) — while **sharing** the expensive machinery: execution units, caches, branch predictors. Two threads then feed instructions into the same core simultaneously; whenever one leaves a unit idle, the other's instructions fill it.
+
+::: {.callout-important}
+## The mental model for Hyper-Threading
+
+A Hyper-Threaded core is **one kitchen with two cooks who share all the equipment** — two sets of hands (registers + PC) but one oven, one stove, one set of knives (execution units + caches). When cook A is waiting for the oven, cook B uses the knives. You get *more done* than one cook, but **nowhere near two full kitchens** — because the equipment is shared, not duplicated.
+
+So a 4-core / 8-thread Hyper-Threaded CPU is **not** 8 cores. It's 4 real cores, each pretending to be 2. Typical real-world gain is roughly **15–30%** on suitable mixed workloads — not 100% — and for code that already saturates the execution units (tight CPU-bound number crunching), the two logical threads just compete for the same units and the gain can be near zero or even slightly negative.
+:::
+
+Python sees the *logical* count. `os.cpu_count()` reports logical processors — Hyper-Threads included — which is why a machine "with 4 cores" often reports 8:
+
+```{python}
+import os
+print(f"logical CPUs visible to Python (incl. Hyper-Threads): {os.cpu_count()}")
+```
+
+This connects three things you now know. **Software threads** (this chapter) are scheduled by the OS onto **logical CPUs**, which sit on **physical cores** that may be **SMT/Hyper-Threaded**. None of it grants CPython true parallel *Python* execution, though — that's still capped by the **GIL**, regardless of how many cores or Hyper-Threads you have. The next chapters pick up exactly there.
+
+::: {.callout-note collapse="true"}
+## ▶ Show the detail: how SMT differs from just "more cores," and who uses what
+
+- **Coarse-grained** multithreading only switches on an expensive stall, so a single thread runs at full speed until it hits, say, a cache miss — then the core swaps to a waiting thread while the miss is serviced. Cheap to build, but it does nothing for the many *short* idle slots.
+- **Fine-grained** (a *barrel processor*) rotates threads every cycle. It hides short stalls beautifully and gives very predictable latency, which is why throughput-oriented chips like Sun/Oracle's **UltraSPARC T-series (Niagara)** used it — but any single thread runs slowly because it only gets every Nth cycle.
+- **SMT** is the most aggressive: it doesn't switch at all, it issues from multiple threads *in the same cycle* into a wide superscalar core. Intel calls its 2-way SMT **Hyper-Threading**; **AMD** (Zen) also does 2-way SMT; **IBM POWER** goes further with **SMT4 and SMT8** (4 and 8 threads per core).
+
+The key distinction from real cores: **SMT shares execution units**, so two SMT threads contend for the same hardware. Two *physical* cores each have their own units and can both run flat-out. That's the whole reason Hyper-Threading's speedup is a fraction of a true core's.
+
+**Security footnote:** because SMT siblings *share* caches and units, one thread can sometimes infer another's activity through timing — the basis of side-channel attacks (e.g. *PortSmash*, and the L1TF/MDS family). Some security-sensitive deployments disable Hyper-Threading for exactly this reason.
+:::
+
+## Q&A from the field
+
+::: {.callout-note collapse="true"}
+## ▶ Q: If a thread "has" a program counter, registers, and a stack — but the CPU only has one set of registers per core, how do they all fit?
+
+They don't fit at once — they take turns. The CPU has one physical set of registers per core, and exactly one thread's values live in them *while that thread is Running*. The moment the scheduler switches threads, it **saves** the outgoing thread's register values into memory (part of its saved context) and **loads** the incoming thread's. So "a thread has registers" really means "a thread has a *saved copy* of register values that gets loaded into the real registers when it's that thread's turn." The PC and stack pointer ride along in that saved context. That save/load is the context switch — and the whole reason thread switches are cheap is that the memory map doesn't have to be swapped too.
+
+**The private state is real; it just lives in the CPU only during the thread's turn, and in memory the rest of the time.**
+:::
+
+::: {.callout-note collapse="true"}
+## ▶ Q: Why can't I read a thread's Ready/Running/Blocked state from Python?
+
+Because those states live in the **operating system's scheduler**, not in the Python object. The `threading.Thread` object knows coarse facts — `is_alive()`, whether it's started, whether it's a daemon — but "is this thread on a core *right now* or queued behind another?" changes microsecond to microsecond inside the kernel, far below Python. By the time Python could read it, it would already be stale. To actually observe scheduling states you need OS-level tools (`top -H`, `htop`, `perf`, a profiler) that read kernel data. That's why our timeline instruments the *boundaries we cause* (start work, start sleeping) rather than polling a "state" attribute — there isn't one.
+:::
+
+::: {.callout-note collapse="true"}
+## ▶ Q: My CPU shows "8 threads" — can I run 8 Python threads truly in parallel then?
+
+Two different "threads" are colliding in that sentence, and separating them answers it. The "8 threads" your CPU reports are **hardware threads** (logical CPUs) — 4 physical cores × 2 Hyper-Threads, say (§7). The threads you make with `threading.Thread` are **software threads**. The OS *can* place 8 software threads onto those 8 logical CPUs at once — so for **I/O-bound** work (all of them mostly Blocked, waiting), yes, you effectively get the overlap.
+
+But for **CPU-bound Python code**, no — and not because of the hardware. CPython's **GIL** lets only **one thread execute Python bytecode at a time**, no matter how many cores or Hyper-Threads exist. Your 8 hardware threads sit mostly idle while your Python threads queue up behind the one lock. That's why the overview chapter sent CPU work to *processes* (each with its own interpreter, its own GIL) rather than threads. The hardware was never the bottleneck for Python crunching — the interpreter is.
+
+**Hardware threads set the ceiling for *physical* parallelism; the GIL sets a *lower* ceiling for parallel *Python* specifically.**
+:::
+
+::: {.callout-note collapse="true"}
+## ▶ Q: Is the "main thread" special, or just the first one?
+
+Mostly just the first one — but with a couple of real privileges. It's created by the interpreter at startup (you never call `start()` on it), it's where signal handlers run, and in many GUI/async frameworks certain operations *must* happen on it. For plain threading, though, it behaves like any other thread: it has its own PC, registers, and stack, it can be Running or Blocked, and when you `.join()` a worker, the **main thread itself goes Blocked** until the worker finishes. The program stays alive as long as any non-daemon thread (main included) is still running.
+:::
+
+## Exercises
+
+### Exercise 1: Count your starting threads
+
+**Task.** Before creating any threads of your own, print `threading.active_count()` and the names from `threading.enumerate()`. Then start two workers that each `time.sleep(1)`, and print the count *again from the main thread* while they're still alive (start them, then print, then join).
+
+**Hint.** Print *between* `start()` and `join()` to catch them while they're alive.
+
+**Expected output.** 1 thread at first (main); 3 while the two workers are alive; back to 1 after joining.
+
+```{python}
+# YOUR CODE HERE
+# Expected: 1 -> 3 -> 1
+```
+
+### Exercise 2: Prove the stack is private
+
+**Task.** Write a function that takes a `name`, sets a **local** variable `note = name`, sleeps a random short time, then prints `note`. Start it in three threads with three different names. Confirm each prints its *own* name — proof that the local lived on a private stack and was never overwritten by the others.
+
+**Hint.** Use `random.uniform(0, 0.2)` for the sleep so the threads interleave; `import random`.
+
+```{python}
+# YOUR CODE HERE
+# Expected: each thread prints the name it was given, never another's.
+```
+
+### Exercise 3: Make the Blocked bars longer
+
+**Task.** Take the timeline demo from §5 and increase each thread's `wait` to a different value (say 0.1, 0.3, 0.5 s). Re-render the figure. Predict *before running*: will the three threads still finish at about the same time, or will the total now be set by the longest wait?
+
+**Hint.** With `.join()` on all three, the program ends only when the *last* one finishes — which is whichever has the longest total Running + Blocked time.
+
+```{python}
+# YOUR CODE HERE
+# Expected: total wall-clock ≈ the single longest thread, not the sum.
+```
+
+## Where this fits
+
+You now know what a thread actually *is* — a privately-owned **(program counter, registers, stack)** riding inside a **shared** process, scheduled by the OS through **Ready → Running → Blocked**. To *see* it, we borrowed the bare minimum of two tools without explaining them: `Thread`/`start`/`join` to make a worker, and a `Lock` to guard a shared list. The next chapters turn each of those from "borrowed tool" into "subject":
+
+- **[Chapter 2 — The Thread class & workers](02_thread_class_and_workers.qmd)** is next: it teaches `Thread` properly — target vs. subclass, passing data in, getting results out, `join(timeout)`, daemon threads, and the traps — and builds the first thread of our running example — a data producer feeding a processing pipeline.
+- **The shared heap is where threads collide.** Two threads writing the same object with no coordination corrupt it — a **race condition** (Chapter 3) — which is *why* the `Lock` above existed (Chapter 4).
+- **The GIL** — why those green "Running" bars can't truly overlap for *CPU* work in CPython, yet threads still win big for *I/O* — gets its own chapter (Chapter 8).
+
+All of it flows from the one arrangement this chapter drew: **private fingers, shared kitchen.**

@@ -1,0 +1,41 @@
+# Preface {.unnumbered}
+
+This is a growing book on **advanced Python programming** — how Python actually *runs*, and how programs do many things at once with **threads, processes, and async**. Each chapter takes one thing that's genuinely confusing and explains it properly — **intuition first, then the mechanics, then runnable code, then pictures** — preserving the real questions that came up along the way.
+
+It is not API reference and not a how-to. It is the "why does it work this way?" layer that the documentation rarely gives you. Code marked runnable is executed when the book is built, so the printed output is real.
+
+## How to read it
+
+- Each chapter stands alone, but they're ordered so earlier ideas unlock later ones.
+- **Collapsible callouts** hold the optional depth — history, derivations, and a *Q&A from the field* section that captures the real back-and-forth that sharpened the chapter. Skip them on a first pass; open them when you hit the same wall.
+- Code blocks marked as runnable (Python) are executed when the book is built, so the printed output is real, not hand-typed.
+
+## Current chapters
+
+**Python Foundations** — how your program actually runs, before anything else:
+
+- **How Python runs your program** — source → bytecode → the interpreter loop; the call stack of frames; the heap where every object lives; names as *references* (why `b = a` shares rather than copies); and what reclaims memory (reference counting + the cyclic GC). The foundation the concurrency part builds on.
+
+**Concurrency — Threads in Depth** — from first principles to expert, one primitive at a time. A single running example (a producer → bounded queue → worker pool → socket-stream pipeline) carries the whole part:
+
+- **What is a thread?** — what a thread is made of (program counter, registers, stack), what it *owns* vs. *shares* with the process, the Ready/Running/Blocked state machine, software vs. hardware threads (Hyper-Threading), and a short history (Dijkstra → POSIX threads → SMT).
+- **The Thread class & workers** — `target` vs. subclassing, passing data in and getting results out, `start`/`join`/`daemon`, the `start()`-vs-`run()` trap, and the pipeline's producer thread.
+- **The race condition** — watch a shared counter come out wrong; dissect the read-modify-write interleaving; and pin down *what is and isn't atomic* in Python.
+- **Lock & RLock** — making operations indivisible (`with lock:`), minimal critical sections, deadlock and lock-ordering, and reentrancy with `RLock`.
+
+*(More chapters — Semaphore, Event/Condition, Queue & thread pools, the GIL, debugging/testing, performance, and a socket-streaming capstone — are in progress.)*
+
+## Building and publishing
+
+From the project root:
+
+```bash
+quarto preview      # live local preview while editing
+quarto render       # build the static site into _book/
+```
+
+To publish to Quarto Pub (free, mobile-friendly hosting):
+
+```bash
+quarto publish quarto-pub
+```

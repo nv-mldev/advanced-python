@@ -1,0 +1,20 @@
+# Python dependencies for the runnable cells in this Quarto book.
+# One-time setup:  uv venv .venv && uv pip install -r requirements.txt
+#
+# Only third-party libraries are listed; the demos also use the standard
+# library (threading, time, sys, dis, inspect, gc, queue) which needs no install.
+#
+# Where each is used:
+#   matplotlib, numpy   -> figures (object refcount/lifetime, thread-state
+#                          timelines, lock-holding intervals, race-result plots)
+
+matplotlib==3.10.9
+numpy==2.4.4
+
+# --- Render tooling (not used by the tutorial code, but required so Quarto's
+#     Jupyter bridge can execute the {python} cells in this venv) ---
+ipykernel==7.3.0
+jupyter-client==8.9.1
+nbclient==0.11.0
+nbformat==5.10.4
+pyyaml==6.0.3

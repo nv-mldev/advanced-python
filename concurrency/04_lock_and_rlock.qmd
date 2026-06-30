@@ -1,0 +1,430 @@
+---
+title: "Lock & RLock — making operations indivisible"
+---
+
+> *"Chapter 3 showed me my counter loses thousands of updates because `+= 1` is really read-then-write, and the threads interleave. Fine — I believe it. Now just tell me how to make it stop, get the right number every time, and not introduce some new disaster while I'm at it."*
+
+[Chapter 3](03_race_conditions.qmd) diagnosed the disease: when two threads run a multi-step operation (read-modify-write, or check-then-act) on **shared mutable state**, their steps interleave and corrupt the result. The cure is one idea — **mutual exclusion**: guarantee that once a thread starts that operation, *no other thread can touch the data until it finishes*. The tool that delivers it is the **lock**.
+
+This chapter makes the racy counter hit exactly `4000` every single time, teaches the full mechanics of `threading.Lock`, then confronts the lock's *own* dark side — **deadlock**, where threads freeze forever waiting on each other — and the discipline that prevents it. Finally we meet `RLock`, the reentrant lock, for when a locked method needs to call another locked method.
+
+## The whole picture
+
+```{mermaid}
+flowchart TB
+    R["The race: read-modify-write<br/>interleaves on shared data"]
+    R --> L["<b>A lock</b> makes that sequence a<br/><b>CRITICAL SECTION</b> — only ONE<br/>thread inside at a time"]
+    L --> OK["Counter is correct, every run<br/>(mutual exclusion)"]
+    L --> D["<b>But two locks, grabbed in<br/>opposite orders</b> → <b>DEADLOCK</b><br/>(both wait forever)"]
+    D --> ORD["Fix: a global <b>lock ORDER</b><br/>— everyone grabs them<br/>in the same sequence"]
+    L --> RL["<b>Same thread needs the lock twice?</b><br/>plain Lock self-deadlocks →<br/>use <b>RLock</b> (reentrant)"]
+    classDef bad fill:#F44336,color:#fff;
+    classDef ok fill:#4CAF50,color:#fff;
+    classDef tool fill:#2196F3,color:#fff;
+    class R,D bad;
+    class OK,ORD ok;
+    class L,RL tool;
+```
+
+## 1. The intuition — the single key to the tally room
+
+Go back to the two cooks and the one tally sheet. The fix is almost insultingly simple: **put the tally sheet in a small room with one key.** To update the tally you must hold the key. There's only one key, so only one cook can be in the room at a time. Cook A takes the key, goes in, reads `41`, writes `42`, comes out, hands the key back. *Only then* can cook B take the key, go in, read `42` (the correct, updated value!), and write `43`. No stale reads, no lost updates.
+
+That room is a **critical section** — a stretch of code that touches shared state and must not be entered by two threads at once. The key is the **lock**. "Acquire the lock" = take the key (and *wait* if someone else has it). "Release the lock" = hand it back. The lock doesn't protect the *data* directly — it enforces a *rule*: **only the key-holder may enter.** Everything about locks follows from that one image.
+
+## 2. The fix — exactly 4000, every time
+
+Here's Chapter 3's racy counter, with the read-modify-write wrapped in a lock. We keep the widened `sleep` window *inside* the critical section to prove the point: even with a wide-open window, no other thread can sneak in, because it can't get the key.
+
+```{python}
+import threading
+import time
+
+counter = 0
+lock = threading.Lock()          # the single key to the counter
+
+def add_many(how_many):
+    global counter
+    for _ in range(how_many):
+        with lock:                       # acquire the key (wait if held)...
+            current = counter            # READ
+            time.sleep(1e-5)             # the race window — but we hold the key
+            counter = current + 1        # WRITE
+        # ...key released automatically when the `with` block ends
+
+N = 2_000
+a = threading.Thread(target=add_many, args=(N,), name="Proc-A")
+b = threading.Thread(target=add_many, args=(N,), name="Proc-B")
+a.start(); b.start()
+a.join(); b.join()
+
+print(f"expected : {2 * N}")
+print(f"actual   : {counter}")
+print(f"LOST     : {2 * N - counter}   ← zero. The race is gone.")
+```
+
+`actual` is exactly `4000`, and it will be `4000` on every run, forever. The same window that lost ~2000 updates in Chapter 3 now loses none, because the lock turned the read-modify-write into a single indivisible step. That's mutual exclusion.
+
+## 3. The mechanics — `with`, blocking, and timeouts
+
+`with lock:` is sugar for `lock.acquire()` … `lock.release()`, with one critical guarantee: **the lock is released even if the body raises an exception.** Always prefer it.
+
+But it's worth seeing the raw methods once, because `acquire` has options you'll need:
+
+```{python}
+import threading
+
+lock = threading.Lock()
+
+print(f"acquire()               → {lock.acquire()}")             # True: got it
+print(f"acquire(blocking=False) → {lock.acquire(blocking=False)}")  # False: held, don't wait
+print(f"acquire(timeout=0.2)    → {lock.acquire(timeout=0.2)}")  # False: waited 0.2s, gave up
+print(f"locked()                → {lock.locked()}")              # True: still held
+lock.release()
+print(f"after release, locked() → {lock.locked()}")             # False
+```
+
+- **`acquire()`** blocks until it gets the lock — the default, and what `with` uses.
+- **`acquire(blocking=False)`** returns immediately: `True` if it got the lock, `False` if someone else holds it. Use it for "try, but don't wait."
+- **`acquire(timeout=N)`** waits at most `N` seconds. Returns `False` if it gave up. This is your escape hatch from a hang — and we'll use it to demonstrate deadlock *without* freezing the book.
+
+::: {.callout-warning}
+## Hold the lock for as little code as possible
+
+A lock **serializes** every thread that wants it — while one holds the key, the others *wait*. So the critical section is the part of your program that *cannot* run in parallel. Make it tiny: do the slow work (the computation, the I/O, the sleep) **outside** the lock, and hold the lock only for the brief shared update.
+
+In §2 we deliberately slept *inside* the lock to prove correctness — but that fully serializes the threads, throwing away the concurrency we wanted. The running example in §7 does it the right way: heavy work outside, a one-line tally inside. **A lock around too much code is "correct but slow"; a lock around too little is "fast but racy." The skill is finding the smallest section that still protects the invariant.**
+:::
+
+## 4. The lock protects a *discipline*, not the data
+
+This is the misconception that causes the most "but I used a lock!" bugs. A lock is just a flag; it has no magical connection to any variable. It works **only because every thread agrees to acquire the same lock before touching the shared data.** One thread that touches the data *without* the lock reopens the race completely — the lock can't stop it, because the renegade never asked for the key.
+
+This also fixes the *other* race family from Chapter 3 — **check-then-act**. The bank withdrawal that could go negative is fixed by putting the check **and** the act inside one critical section, so no thread can change the balance between them:
+
+```{python}
+import threading
+
+balance = 100
+lock = threading.Lock()
+
+def withdraw(amount):
+    global balance
+    with lock:                       # check AND act are now ONE indivisible step
+        if balance >= amount:        # CHECK
+            balance -= amount        # ACT — no thread can change `balance` between
+            return True
+        return False
+
+# two threads each try to withdraw 80 from a balance of 100; only ONE should win
+results = []
+def attempt():
+    results.append(withdraw(80))
+
+t1 = threading.Thread(target=attempt)
+t2 = threading.Thread(target=attempt)
+t1.start(); t2.start(); t1.join(); t2.join()
+
+print(f"withdrawal results: {results}   (exactly one True — balance never goes negative)")
+print(f"final balance: {balance}")
+```
+
+Exactly one withdrawal succeeds; the balance lands on `20`, never `-60`. The check and the act are welded together by the lock.
+
+## 5. Deadlock — the lock's dark side
+
+Locks solve races but introduce a new failure: **deadlock**, where two (or more) threads each hold a lock the other needs, and both wait forever. Nothing crashes; the program just *freezes*. It happens whenever threads acquire **multiple** locks in **inconsistent orders**.
+
+The classic setup: lock A and lock B. Thread 1 grabs A then wants B; thread 2 grabs B then wants A. Each holds what the other needs.
+
+::: {.callout-warning}
+## We use `acquire(timeout=...)` here so the book doesn't hang
+
+A *real* deadlock blocks forever — which would freeze this book's build. To *demonstrate* a genuine deadlock safely, the second acquire below uses a `timeout`: the threads really do deadlock, and the timeout is what breaks them free after half a second so we can observe it. In production code the timeout returning `False` is itself a useful deadlock *detector*.
+:::
+
+```{python}
+import threading
+import time
+
+lock_a = threading.Lock()
+lock_b = threading.Lock()
+
+def grab_a_then_b():
+    with lock_a:                              # thread 1 takes A
+        time.sleep(0.05)                      # ...and pauses so thread 2 can take B
+        got = lock_b.acquire(timeout=0.5)     # now wants B — which thread 2 holds
+        if got:
+            lock_b.release()
+        print(f"  [A→B] got the second lock? {got}")
+
+def grab_b_then_a():
+    with lock_b:                              # thread 2 takes B
+        time.sleep(0.05)
+        got = lock_a.acquire(timeout=0.5)     # now wants A — which thread 1 holds
+        if got:
+            lock_a.release()
+        print(f"  [B→A] got the second lock? {got}")
+
+t1 = threading.Thread(target=grab_a_then_b)
+t2 = threading.Thread(target=grab_b_then_a)
+t1.start(); t2.start(); t1.join(); t2.join()
+print("both reported False → a real deadlock, broken only by the timeout")
+```
+
+Both threads report `False`: neither could get its second lock, because each was held by the other. Without the `timeout`, that's a permanent freeze.
+
+### The fix: a global lock order
+
+The cure is a rule so simple it feels like cheating: **every thread acquires the locks in the same order.** If everyone grabs A *before* B, the deadlock is structurally impossible — whoever gets A first will get B too; the other simply waits for both, then proceeds.
+
+```{python}
+import threading
+import time
+
+lock_a = threading.Lock()
+lock_b = threading.Lock()
+
+def grab_in_order(name):
+    with lock_a:                 # EVERYONE takes A first...
+        time.sleep(0.05)
+        with lock_b:             # ...then B. No opposite-order grabbing exists.
+            print(f"  [{name}] acquired A then B — working safely")
+
+t1 = threading.Thread(target=grab_in_order, args=("T1",))
+t2 = threading.Thread(target=grab_in_order, args=("T2",))
+t1.start(); t2.start(); t1.join(); t2.join()
+print("no deadlock — one thread waited for the other, then ran")
+```
+
+Both complete. The rule generalizes: **assign every lock a global order (by name, by id, by a fixed hierarchy) and always acquire them in that order.** It's the single most important habit for multi-lock code.
+
+## 6. `RLock` — when the same thread needs the lock again
+
+A plain `Lock` has a sharp edge: if the thread that already holds it tries to acquire it *again*, it **deadlocks against itself** — it's waiting for a lock that only it could release, but it's stuck waiting. Watch (timeout-protected, again):
+
+```{python}
+import threading
+
+lock = threading.Lock()
+lock.acquire()
+again = lock.acquire(timeout=0.5)     # SAME thread tries to re-acquire → can't
+print(f"plain Lock, re-acquired by its own holder? {again}  ← False: self-deadlock")
+lock.release()
+```
+
+When does a thread accidentally re-acquire its own lock? Constantly — whenever a **locked method calls another locked method** on the same object. That's where `RLock` (reentrant lock) comes in: it lets the **owning** thread acquire it any number of times, releasing fully only when it has released as many times as it acquired.
+
+```{python}
+import threading
+
+rlock = threading.RLock()
+rlock.acquire()
+again = rlock.acquire(timeout=0.5)    # the OWNER may re-enter freely
+print(f"RLock, re-acquired by its own holder? {again}  ← True: reentrant")
+rlock.release(); rlock.release()       # release once per acquire
+```
+
+The real-world case — an `Account` whose `withdraw` is implemented via `deposit`, both guarded:
+
+```{python}
+import threading
+
+class Account:
+    def __init__(self, balance):
+        self._lock = threading.RLock()     # RLock: withdraw() re-enters via deposit()
+        self._balance = balance
+
+    def deposit(self, amount):
+        with self._lock:
+            self._balance += amount
+
+    def withdraw(self, amount):
+        with self._lock:                    # holds the lock...
+            self.deposit(-amount)           # ...then deposit() acquires it AGAIN
+
+    @property
+    def balance(self):
+        with self._lock:
+            return self._balance
+
+acct = Account(100)
+acct.withdraw(30)        # with a plain Lock this line would freeze forever
+print(f"balance after withdraw(30): {acct.balance}")
+```
+
+With a plain `Lock`, `withdraw` calling `deposit` would self-deadlock. With `RLock` it just works.
+
+::: {.callout-note collapse="true"}
+## ▶ Q: So should I just always use `RLock` to be safe?
+
+Tempting, but no — prefer a plain `Lock` by default, and reach for `RLock` only when you genuinely have *nested* acquisition by the same thread (a locked method calling another locked method). Two reasons. First, `RLock` is slightly more expensive (it tracks the owner and a recursion count). Second, and more importantly, a plain `Lock`'s self-deadlock is a **useful alarm**: it tells you your locking structure has accidental nesting you didn't notice. `RLock` *silences* that alarm — convenient when the nesting is intentional, but it can also hide a tangled design. Use `Lock` until you have a concrete reason for reentrancy; let the self-deadlock catch your mistakes.
+:::
+
+## 7. The running example — a thread-safe stats object
+
+Now we fix our pipeline properly. Chapter 3 corrupted the shared `items_processed`/`errors_found` stats. We wrap them in a small **thread-safe object**: the lock lives *with* the data it protects (the monitor pattern), and the critical section is one line — the heavy "work" stays outside the lock.
+
+```{python}
+import threading
+import time
+
+class PipelineStats:
+    """Thread-safe statistics for the processing pipeline.
+    The lock guards the counters; it lives with the data it protects."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._items_processed = 0
+        self._errors_found = 0
+
+    def record(self, error=False):
+        with self._lock:                  # tiny critical section: just the tally
+            self._items_processed += 1
+            if error:
+                self._errors_found += 1
+
+    def snapshot(self):
+        with self._lock:                  # read both consistently, as a pair
+            return self._items_processed, self._errors_found
+
+
+stats = PipelineStats()
+
+def process(n):
+    for i in range(n):
+        time.sleep(2e-5)                  # the heavy item work — OUTSIDE the lock
+        stats.record(error=(i % 7 == 0))  # only the shared tally is locked (brief)
+
+ITEMS = 1_000
+workers = [threading.Thread(target=process, args=(ITEMS,), name=f"Worker-{i}")
+           for i in range(2)]
+for w in workers: w.start()
+for w in workers: w.join()
+
+processed, errors = stats.snapshot()
+print(f"items_processed: {processed}  (expected {2 * ITEMS})")
+print(f"errors_found   : {errors}  (expected {2 * (ITEMS // 7 + 1)})")
+```
+
+`items_processed` is exactly `2000`, every run — and because the heavy work is *outside* the lock, the two threads' processing genuinely overlaps; only the microsecond tally update serializes. That's the production pattern: **lock the bookkeeping, not the work.**
+
+::: {.callout-important}
+## Lock ordering applies to *our* system too
+
+The moment our pipeline has more than one lock — say one for `stats` and one for the shared `latest_result` buffer — the deadlock rule from §5 binds us: if the producer thread ever grabs `result_lock` then `stats_lock`, while a worker thread grabs `stats_lock` then `result_lock`, they can deadlock. The defense is the same global order: **decide once that `stats_lock` is always acquired before `result_lock`** (or never hold both at all, which is even better). The cleanest systems minimize how many locks a thread holds simultaneously — often by handing data off through a *queue* instead of sharing it under locks, which is exactly where Chapter 7 goes.
+:::
+
+## 8. Visualization — mutual exclusion, seen
+
+What does "only one thread inside at a time" actually look like? Let's instrument *when each thread holds the lock* and plot it. The signature of correct mutual exclusion is that **the lock-holding bars never overlap** — they tile the timeline end to end, one thread at a time.
+
+```{python}
+#| fig-cap: "When each thread is holding the lock (the critical section). The bars never overlap — that IS mutual exclusion: while one thread holds the key, the others wait. The work between critical sections (not shown) overlaps freely; only the locked region is serialized."
+import threading
+import time
+import matplotlib.pyplot as plt
+
+lock = threading.Lock()
+events = []
+events_lock = threading.Lock()
+t_start = time.perf_counter()
+
+def worker(name, rounds):
+    for _ in range(rounds):
+        time.sleep(0.005)                 # unshared work — happens in parallel
+        with lock:                        # critical section
+            acq = time.perf_counter() - t_start
+            time.sleep(0.01)              # hold the lock briefly
+            rel = time.perf_counter() - t_start
+        with events_lock:
+            events.append((name, acq, rel))
+
+names = ["Proc-A", "Proc-B", "Proc-C"]
+threads = [threading.Thread(target=worker, args=(n, 4)) for n in names]
+for t in threads: t.start()
+for t in threads: t.join()
+
+row = {n: i for i, n in enumerate(reversed(names))}
+fig, ax = plt.subplots(figsize=(9, 3.2))
+colors = {"Proc-A": "#2196F3", "Proc-B": "#4CAF50", "Proc-C": "#9C27B0"}
+for name, acq, rel in events:
+    ax.broken_barh([(acq * 1000, (rel - acq) * 1000)], (row[name] - 0.35, 0.7),
+                   facecolors=colors[name], edgecolor="white")
+ax.set_yticks(range(len(names))); ax.set_yticklabels(list(reversed(names)))
+ax.set_xlabel("time (ms)", fontsize=11); ax.set_ylabel("thread", fontsize=11)
+ax.grid(True, axis="x", alpha=0.3)
+ax.set_title("Lock-holding intervals never overlap = mutual exclusion", fontsize=10)
+plt.tight_layout()
+plt.show()
+```
+
+Three threads, but at any vertical slice of time **at most one** is holding the lock. That gap-free, non-overlapping tiling is mutual exclusion made visible — and it's exactly why the counter can't be corrupted: there is never a moment when two threads are inside the critical section together.
+
+## Q&A from the field
+
+::: {.callout-note collapse="true"}
+## ▶ Q: There's already a GIL that serializes Python — why do I *also* need a lock?
+
+Because they protect different things at different granularities. The **GIL** makes individual *bytecodes* atomic (Chapter 3); your **lock** makes a *sequence of statements* — your critical section — atomic. The GIL guarantees one thread runs bytecode at a time, but it freely switches threads *between* the bytecodes of your `counter += 1`, which is the whole race. Your lock is what stops a switch mid-update from mattering, by making other threads *wait* before they even start. Put bluntly: the GIL protects the *interpreter's* internals; your lock protects *your* invariants. And the GIL is going away (free-threaded Python, Chapter 8) — code that leaned on it will break, while code with proper locks keeps working. Locks are the portable, correct tool; GIL-atomicity is an implementation accident.
+:::
+
+::: {.callout-note collapse="true"}
+## ▶ Q: Aren't locks slow? I've heard "lock-free" is better.
+
+A lock you *don't contend* is cheap — acquiring an uncontended `threading.Lock` is a fast operation. The cost shows up under **contention**: when many threads pile up waiting for the same lock, they serialize, and your concurrency evaporates (Chapter 11 measures this). The fix is almost never "remove the lock" — it's **hold it for less time** (smaller critical sections, §3) or **contend it less** (shard the data so threads use different locks, or hand data off through a queue so they don't share at all). "Lock-free" algorithms exist but are extremely hard to get right; for application code, a well-scoped lock is the correct default. Optimize the *critical section*, not the *existence* of the lock.
+:::
+
+::: {.callout-note collapse="true"}
+## ▶ Q: What happens if I forget to `release()`? Or release a lock I don't hold?
+
+Forgetting to release is the classic hang: the next thread to `acquire()` waits forever for a key that's never coming back. This is *exactly* why you use `with lock:` — it releases automatically at the end of the block, **even if an exception is raised** inside it. Manual `acquire()`/`release()` pairs are fragile precisely because an early `return` or an exception can skip the `release()`. As for releasing a lock you don't hold: a plain `Lock` will raise `RuntimeError: release unlocked lock` (it doesn't track an owner, so any over-release errors); an `RLock` raises `RuntimeError: cannot release un-acquired lock` because it *does* track ownership. Bottom line: **use `with`, and you sidestep the entire category.**
+:::
+
+## Exercises
+
+### Exercise 1: Fix Chapter 3's bank-withdrawal bug
+
+**Task.** Chapter 3, Exercise 4 had a `withdraw` that could drive the balance negative under concurrency. Using a lock, fix it so that with a starting balance of `100` and ten threads each trying to withdraw `30`, the balance never goes negative and exactly the right number of withdrawals succeed.
+
+**Hint.** The check (`balance >= amount`) and the act (`balance -= amount`) must be in the *same* `with lock:` block.
+
+```{python}
+# YOUR CODE HERE
+# Expected: 3 successful withdrawals (3×30=90 ≤ 100), final balance 10, never negative.
+```
+
+### Exercise 2: Reproduce, then fix, a deadlock
+
+**Task.** Write two threads that deadlock over two locks acquired in opposite orders (use `acquire(timeout=...)` so your test terminates). Confirm they deadlock. Then rewrite them to acquire both locks in a consistent global order and confirm they complete.
+
+```{python}
+# YOUR CODE HERE
+```
+
+### Exercise 3: Measure the cost of a too-big critical section
+
+**Task.** Run the §7 pipeline two ways: (a) with the `time.sleep` "work" *outside* the lock (as written), and (b) with the work moved *inside* the lock. Time both with `time.perf_counter()`. Explain why (b) is much slower even though both give the correct count.
+
+**Hint.** Inside the lock, the threads can't overlap their work — the lock serializes everything it spans.
+
+```{python}
+# YOUR CODE HERE
+# Expected: (b) ≈ sum of all work; (a) ≈ work overlapped → much faster.
+```
+
+### Exercise 4 (Pipeline): a thread-safe latest-result buffer
+
+**Task.** Build a `LatestResult` class with `set(result)` and `get()` methods, both guarded by a lock, so a producer thread can write the newest result while worker threads read it without tearing. Add a `count` of how many results have been set. Verify with one writer thread and two reader threads.
+
+```{python}
+# YOUR CODE HERE
+```
+
+## Where this fits
+
+You can now make any multi-step operation indivisible with a **lock** (`with lock:`), you understand that the lock protects a *discipline* (everyone uses the same key) rather than the data itself, you can keep critical sections minimal so concurrency survives, and you can both **cause** and **prevent** deadlock (global lock ordering) and handle reentrancy with **`RLock`**.
+
+But notice the shape of every lock so far: it lets *exactly one* thread through at a time. Sometimes that's too strict — you don't want "one at a time," you want "**at most N at a time**": at most 3 jobs on a GPU, at most 10 open connections, at most some bounded number of items buffered. A lock can't express "N"; it only knows "1."
+
+[Chapter 5](05_semaphore.qmd) generalizes the lock into the **`Semaphore`** — a lock with *N* keys instead of one — and its safer sibling `BoundedSemaphore`. We'll use it to cap concurrent processing in the pipeline and to build a **bounded buffer**, the structure that stops a fast producer from overwhelming slow consumers. A lock is just a semaphore with one key; once you see that, both click into place.

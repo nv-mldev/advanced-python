@@ -1,0 +1,10 @@
+/_book/
+/.quarto/
+*_files/
+/site_libs/
+.jupyter_cache/
+
+**/*.quarto_ipynb
+
+# Project virtual environment (recreate with: uv venv .venv && uv pip install -r requirements.txt)
+/.venv/

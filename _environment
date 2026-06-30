@@ -1,0 +1,5 @@
+# Quarto reads this file for project-scoped environment variables.
+# Point Quarto at THIS project's own venv (created with: uv venv .venv)
+# so the runnable cells use the pinned deps in requirements.txt, independent
+# of any global QUARTO_PYTHON in the shell.
+QUARTO_PYTHON=.venv/bin/python
