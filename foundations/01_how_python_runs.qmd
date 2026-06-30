@@ -46,12 +46,35 @@ def add(a, b):
 dis.dis(add)
 ```
 
-Read it top to bottom — these are the literal steps the interpreter will execute:
+Read it top to bottom. The **exact opcode names depend on your Python version** — CPython keeps optimizing the bytecode between releases (see the Q&A below if yours looks different) — but the *logical* steps are always the same:
 
-- `LOAD_FAST a` / `LOAD_FAST b` — push the two local variables onto a working stack
-- `BINARY_OP +` — pop two values, add them, push the result
-- `STORE_FAST total` — pop the result into the local `total`
-- `LOAD_FAST total` / `RETURN_VALUE` — push it back and return it
+- **load** the two locals `a` and `b` onto a working stack
+- **add** them — `BINARY_OP +` pops the two values and pushes the result
+- **store** that result into the local `total` (`STORE_FAST`)
+- **load** `total` back and **return** it (`RETURN_VALUE`)
+
+You may also see a `RESUME` at the very top — that's not a real operation; it's a marker CPython places at function entry (more on it below). The point isn't the precise mnemonics; it's that one line of Python, `total = a + b`, is **several** machine-level steps — a fact that becomes the whole story of race conditions later in the book.
+
+::: {.callout-note collapse="true"}
+## ▶ Q: My disassembly looks different — `RESUME`, `LOAD_FAST_LOAD_FAST`, `LOAD_FAST_BORROW`… what are those?
+
+Your output depends on which Python you ran — CPython optimizes its bytecode every release, so the *same* function disassembles differently across versions. For `total = a + b`, the two loads of `a` and `b` look like:
+
+| Python | The two loads appear as |
+|---|---|
+| 3.12 and earlier | `LOAD_FAST a` then `LOAD_FAST b` (two separate ops) |
+| 3.13 | `LOAD_FAST_LOAD_FAST (a, b)` — a **superinstruction**: one op does both loads |
+| 3.14+ | `LOAD_FAST_BORROW_LOAD_FAST_BORROW (a, b)` — same, with *borrowed* references |
+
+All three do the identical thing — push `a` and `b` onto the stack — just fused and optimized differently. The other opcodes you might see:
+
+- **`RESUME`** — a no-op marker (since 3.11) at function entry and after `yield`/`await`; a resume/instrumentation point, not a data operation.
+- **superinstructions** (`LOAD_FAST_LOAD_FAST`) — two common ops fused into one to cut the interpreter's per-instruction dispatch overhead.
+- **`_BORROW` variants** (3.14) — push a reference *without* incrementing its reference count, when the compiler can prove it's safe. A pure speed optimization; same observable effect. (Reference counts are §6.)
+- **`BINARY_OP 0 (+)`** — one generic "binary operation" op whose argument selects `+`; it replaced the old per-operator opcodes (`BINARY_ADD`, …) in 3.11.
+
+So if you ran this on **3.14** you'd see `RESUME`, `LOAD_FAST_BORROW_LOAD_FAST_BORROW`, `BINARY_OP`, `STORE_FAST`, `LOAD_FAST_BORROW`, `RETURN_VALUE` — the same five logical steps above, just in 3.14's optimized dialect. **Don't memorize opcode names; read the *shape*.**
+:::
 
 ::: {.callout-note collapse="true"}
 ## ▶ Q: "Compiled to bytecode" — so is Python compiled or interpreted?
